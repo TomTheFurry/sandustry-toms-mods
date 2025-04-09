@@ -1,10 +1,29 @@
 
 exports.modinfo = {
     name: "ll-elements",
-    version: "0.1.0",
+    version: "0.2.0",
     dependencies: [],
     modauthor: "TomTheFurry",
 };
+
+// v.2 updates:
+// - Addexd color conflict resolution
+//   No longer need to worry about color value conflicts with adding stuff!
+//   The lib will now auto-nudge the color values for the conflicting elements/soils
+// - Added Save Data Enhancement
+//   This additional data will be used to help the game load the save data correctly
+//   even if the mod list is changed and ids got shuffled around. Yes, this mean saves
+//   are much more resilient to mod changes, including removals and reorders of mods!
+// - Added Patch Color Overflow
+//   The game engine has an issue where color ids are maxed out at 255, and since each
+//   soil type contains roughly 11 color ids, this would mean that game runs out of ids
+//   really quickly, and will cause corruptions and etc. This patch fixes the issue by
+//   increasing the color id space to a 16 bit space, which is 65536 ids. This means
+//   you can now add more than just 3 to 4 soil types now!
+// - Added hook: launchElementAsParticle(...) - Launch an element as a particle
+// - Bug fixes:
+//   - Fixed physics-crash on vanilla burnable soils getting burned
+//   - Fixed physics-crash on vanilla fog discovery
 
 
 // ==== Headers / Class Defs ====
@@ -219,24 +238,25 @@ class CellTypeDefinition {
 // ==== Implementation ====
 // #region Implementation
 
-const BaseEndOfCellId = 31 + 1; // 9 as buffer
-const BaseEndOfElementId = 21 + 1; // 9 as buffer
+const BaseEndOfCellId = 31 + 5; // 5 as buffer
+const BaseEndOfElementId = 21 + 5; // 5 as buffer
 // if true, will apply color conflict resolution
 // to prevent different elements mapping to the same color
 // Such cases will causes weird game issues like wrong element behaviors,
 // but atm would not cause crashes or anything like that.
 // Note: This config WILL effect save data, as in save must use the same setting to load correctly
-const ApplyColorConflictResolution = false;
+const ApplyColorConflictResolution = true;
 
 // if true, mod will store the different id mappings to the save data,
 // and leave enough info for later recovery when mod list is changed
 // Note: Nothing is perfect and this is only gonna improve the chance of successful loading of saves
-const AddSaveDataEnhancement = false;
+const AddSaveDataEnhancement = true;
  // if true, will patch the color id overflow issue in the game 
 const PatchColorIdOverflow = true;
 
 class LibElementsApi /** @implements {LibApi} */ {
     id = "LibElementsApi";
+    version = "2.0.0";
     /** @type {Recipe<PhysicCtx>[]} */
     KineticRecipes = [];
     /** @type {Recipe<InteractionCtx>[]} */
@@ -692,8 +712,7 @@ class LibElementsApi /** @implements {LibApi} */ {
                     (cType,eType,fog,x,y,ne) => `return ${fog}===${cType}.FogWater?${ne}(${eType}.Water,${x},${y})`,
                     (cType,eType,fog,x,y,ne) => `return ${
                     Object.entries(soilFogToResultMapping).map(([fogId, elmType]) =>
-                        `${fog}===${cType}.${fogId}?${ne}(${eType}.${elmType},${x},${y}):\n`).join("")}
-                    ${fog}===${cType}.FogWater?${ne}(${eType}.Water,${x},${y})`
+                        `${fog}===${cType}.${fogId}?${ne}(${eType}.${elmType},${x},${y}):\n`).join("")}${fog}===${cType}.FogWater?${ne}(${eType}.Water,${x},${y})`
                 );
             }
         }
@@ -804,7 +823,7 @@ class LibElementsApi /** @implements {LibApi} */ {
             ll.AddPatternPatches(
                 {"main": ["u"]},
                 (mapData) => `${mapData}=new SharedArrayBuffer(`,
-                (mapData) => `${mapData}=new SharedArrayBuffer(4*`,
+                (mapData) => `${mapData}=new SharedArrayBuffer(2*`,
             );
             // Next, patch the 'view' array constructor
             ll.AddPatternPatches(
@@ -817,7 +836,7 @@ class LibElementsApi /** @implements {LibApi} */ {
             ll.AddPatternPatches(
                 {"main": ["a","i"]},
                 (v,t) => `.elementColorByColorId,${v}=(`,
-                // note: 100 is needed as shader hardcoded solid grounds to be 100+
+                // note: >100 is needed as shader hardcoded solid grounds to be 100+
                 (v,t) => `.elementColorByColorId, _startingColorId=Math.max(${t}.colorId,100),${v}=(`
             );
             ll.AddPatternPatches(
@@ -831,36 +850,31 @@ class LibElementsApi /** @implements {LibApi} */ {
                 (clrIds,clrId) => `,(()=>{do {${clrId}++} while (Object.keys(${clrIds}).includes(""+${clrId}))})(),${clrId}`,
                 5
             );
-            // Also need to update GL texture type to be 16 bit ushort
+            // Also need to update GL texture type to be 8 bit RG
             ll.AddPatches([
-                {
+                { // Make the texture type to be 8 bit RG instead of 8 bit R, and update buf size
                     type: "replace",
                     from: "R=new Uint8Array(P.width*P.height),I=Rr.fromBuffer(R,P.width,P.height,{format:fe.RED,type:me.UNSIGNED_BYTE})",
-                    to: `DUMPIT = (()=>{debugger;})(),R=new Uint16Array(P.width*P.height*2),I=Rr.fromBuffer(R,P.width,P.height,{format:fe.RED_INTEGER,type:me.UNSIGNED_SHORT})`,
+                    to: "R=new Uint8Array(P.width*P.height*2),I=Rr.fromBuffer(R,P.width,P.height,{format:fe.RG,type:me.UNSIGNED_BYTE})",
                     expectedMatches: 1,
                 },
-                // {
-                //     type: "replace",
-                //     from: "r.pixi.tilemap.set(c)",
-                //     to: `r.pixi.tilemap.set(new Uint8Array(c.buffer))`,
-                // },
-                {
+                { // Have the setter cast the buffer to byte array
                     type: "replace",
-                    from: ",s=e instanceof Float32Array?",
-                    to: `;var s = (r?.type == me.UNSIGNED_SHORT ? me.UNSIGNED_SHORT : null); s ??= e instanceof Float32Array?`,
+                    from: "r.pixi.tilemap.set(c)",
+                    to: `r.pixi.tilemap.set(new Uint8Array(c.buffer))`,
                     expectedMatches: 1,
                 },
-                {
+                { // Update the clrIdLookup texture func to go though all color ids
                     type: "replace",
                     from: "(e,t,n){var r=M.Darkness+1,",
-                    to: `(e,t,n){debugger;var r = Math.max(M.Darkness,...Object.keys(n).map(Number))+1,`,
+                    to: `(e,t,n){var r = Math.max(M.Darkness,...Object.keys(n).map(Number))+1,`,
                     expectedMatches: 1,
                 },
-                {
+                { // update the shader to use both r and g channel, combining them to 16 bit val
                     type: "replace",
                     from: "float getTileValue(vec2 coord, sampler2D texture)",
                     to: `${JSON.stringify(`
-                        float getTileValue(vec2 coord, usampler2D sampler)
+                        float getTileValue(vec2 coord, sampler2D texture)
                         {
                             // Normalizing to [0, 1] and flipping y-coordinate
                             vec2 relativeCoord = vec2(coord.x / uResolution.x, (uResolution.y - coord.y) / uResolution.y);
@@ -870,89 +884,59 @@ class LibElementsApi /** @implements {LibApi} */ {
                             vec2 cameraOffset = mod(uCameraPosition, vec2(4.0));
                             tilemapCoord += cameraOffset / uResolution * uTilemapSize;
                             vec2 tileCoord = floor(tilemapCoord);
-                            vec2 textureCoord = (tileCoord + vec2(0.5)) / uTilemapSize;
-                            // Sample the 2D texture at the calculated texture coordinates
-                            float tileValue = float(texture(sampler, textureCoord).r);
-                            return tileValue;
-                        }`).slice(1,-1)}\\nfloat getTileValue(vec2 coord, sampler2D sampler)`,
+
+                            vec4 tileClr = texture2D(texture, (tileCoord + vec2(0.5)) / uTilemapSize);
+                            float tileLow = tileClr.r;
+                            float tileHigh = tileClr.g;
+                            float tileValueLow = tileLow * 255.0;
+                            float tileValueHigh = tileHigh * 255.0 * 256.0;
+                            return tileValueLow + tileValueHigh;
+                        }`).slice(1,-1)}\\nfloat getTileValueOld(vec2 coord, sampler2D texture)`,
                     expectedMatches: 1,
                 },
-                {
+                { // have the wall tilemap use old func instead of the new one, as that aren't changed
                     type: "replace",
-                    from: "float tileValue = texture2D(texture, textureCoord).r * 255.0;",
-                    to: `float tileValue = texture(sampler, textureCoord).r * 255.0;`,
+                    from: "getTileValue(gl_FragCoord.xy, uWallTilemapTexture)",
+                    to: `getTileValueOld(gl_FragCoord.xy, uWallTilemapTexture)`,
                     expectedMatches: 1,
                 },
-                // {
-                //     type: "replace",
-                //     from: "getTileValue(vec2 coord, sampler2D texture)",
-                //     to: `getTileValue(vec2 coord, usampler2D sampler)`,
-                //     expectedMatches: 1,
-                // },
-                {
-                    type: "replace",
-                    from: `"#define N 100.0\\n#define MAX_LIGHTS 100`,
-                    to: `"#version 300 es\\n precision highp usampler2D; \\n#define N 100.0\\n#define MAX_LIGHTS 100`,
-                    expectedMatches: 2,
-                },
-                {
-                    type: "replace".replace(/(.*\n)(#version.*?\n)/ms, "$2$1"),
-                    from: `this.glPrograms={},`,
-                    to: `this.glPrograms={},
-                    this.vertexSrc=this.vertexSrc.replace(/(.*\\n)(#version.*?\\n)/ms,"$2$1"),
-                    this.fragmentSrc=this.fragmentSrc.replace(/(.*\\n)(#version.*?\\n)/ms,"$2$1"),
-                    this.HAS_V3=this.vertexSrc.includes("#version 300 es") || this.fragmentSrc.includes("#version 300 es"),
-                    this.HAS_V3=!this.HAS_V3?undefined:(
-                        this.fragmentSrc = !this.fragmentSrc.includes("gl_FragColor")
-                            ? this.fragmentSrc
-                            : ("#define gl_FragColor outFragColor\\nout mediump vec4 outFragColor;\\n"
-                                + this.fragmentSrc)
-                            .replace(/(.*\\n)(#version.*?\\n)/ms,"$2$1"),
-                        this.vertexSrc = this.vertexSrc.includes("#version 300 es")
-                            ? this.vertexSrc : "#version 300 es\\n"+this.vertexSrc,
-                        this.fragmentSrc = this.fragmentSrc.includes("#version 300 es")
-                        ? this.fragmentSrc : "#version 300 es\\n"+this.fragmentSrc,
-                        this.vertexSrc = this.vertexSrc
-                            .replace(/\\bvarying\\b/g,"out")
-                            .replace(/\\battribute\\b/g,"in")
-                            .replace(/\\btexture2D\\(/g, "texture("),
-                        this.fragmentSrc = this.fragmentSrc
-                            .replace(/\\bvarying\\b/g,"in")
-                            .replace(/\\btexture2D\\(/g, "texture("),
-                    undefined),
-                    `,
-                    expectedMatches: 1,
-                },
-                {
+                { // insert the runtime-shader-compile-time replace tag for setting thee lookup count
                     type: "replace",
                     from: "(tileValue + 0.5) / 255.0;",
                     to: `(tileValue + 0.5) / ##COLORID_LOOKUP_TEXTURE_WIDTH##;`,
                     expectedMatches: 1,
                 },
-                {
-                    type: "replace",
-                    from: "uniform sampler2D uTilemapTexture;",
-                    to: `uniform usampler2D uTilemapTexture;`,
-                    expectedMatches: 2,
-                },
-                {
-                    type: "replace",
-                    from: "float tileValue = texture2D(uTilemapTexture, textureCoord).r * 255.0;",
-                    to: `float tileValue = float(texture2D(uTilemapTexture, textureCoord).r);`,
-                    expectedMatches: 1,
-                },
-                {
+                { // apply the runtime-shader-compile-time replacement to the shader string
                     type: "replace",
                     from: `;\\n}",{uResolution:[o.width,o.height],minLightAmount`,
                     to: `;\\n}"
                     .replace("##COLORID_LOOKUP_TEXTURE_WIDTH##", \`\${N.baseTexture.width}.0\`)
-                    .replace(/\\btexture2D\\(/g, "texture(")
-                    //.replace(/\\bgl_FragColor\\b/g, "outFragColor")
-                    
                     ,{uResolution:[o.width,o.height],minLightAmount`,
                     expectedMatches: 1,
-                }
-            ])
+                },
+                { // update the blitting func to have a 16 bit varient
+                    type: "replace",
+                    from: `function Pf(e,t,n,r,i,s){`,
+                    to: `
+                    function Pf_16Bit(e_buff, t_ox, n_oy, r_w, i_h, s_stride) {
+                        for (var o = new Uint16Array(r_w * i_h),
+                            a_row = 0; a_row < i_h; a_row++) {
+                            var l_rowStartIdx = (n_oy + a_row) * s_stride + t_ox,
+                                u_rowEndIdx = l_rowStartIdx + r_w;
+                            o.set(e_buff.subarray(l_rowStartIdx, u_rowEndIdx), a_row * r_w)
+                        }
+                        return o
+                    }
+                    function Pf(e,t,n,r,i,s){`,
+                    expectedMatches: 1,
+                },
+                { // and have the map data tilemap use the 16 bit version
+                    type: "replace",
+                    from: "c=Pf(n.shared.mapData.data,",
+                    to: `c=Pf_16Bit(n.shared.mapData.data,`,
+                    expectedMatches: 1,
+                },
+            ]);
         }
 
         if (ApplyColorConflictResolution) {
@@ -980,27 +964,13 @@ class LibElementsApi /** @implements {LibApi} */ {
                 (v1,f1,glb) => `${v1}=${f1}(${glb},`,
                 (v1,f1,glb) => `globalThis.hookOnLoadSaveEndInjectEnhancement(${glb}),${v1}=${f1}(${glb},`,
             );
-            // Disabled as this below doesn't fix the worker's save data, and also fail to handle removal of elements
-            // ll.AddPatternPatches(
-            //     {"main": ["o", "i", "s"]},
-            //     (v1,v2,glb) => `},${v1}=${v2}.terrain,`,
-            //     (v1,v2,glb) => `},globalThis.hookOnLoadSaveStartApplyEnhancement(${glb}),${v1}=${v2}.terrain,`,
-            // );
             // Alternative
             ll.AddPatternPatches(
                 {"main": ["e","r.data"]}, // note: not using 't' cause that got shadowed.
                 (cell,store) => `{return Array.isArray(${cell})?{cellType:${cell}[0],hp:${cell}[1]}`,
                 (cell,store) => `{${cell}=globalThis.hookSaveEnhancementPatchValue(${store},${cell});return Array.isArray(${cell})?{cellType:${cell}[0],hp:${cell}[1]}`,
             );
-
         }
-
-        // ll.AddPatternPatches(
-        //     {"main": []},
-        //     () => `.world.matrix[l].length;u++)`,
-        //     () => `.world.matrix[l].length;u++)globalThis.DUMP = (()=>{var sFunc=(()=>{sFunc=(()=>{});debugger;});return sFunc();})(),`,
-        //     3
-        // );
 
     };
 }
@@ -1237,7 +1207,8 @@ globalThis.llElementsPreHook = function () {
         if (elmDataOutput) {
             var result;
             if (!Array.isArray(elmDataOutput)) {
-                result = Math.random() < (elmDataOutput.chance ?? 1) ? [elmDataOutput.elementType] : []; 
+                    result = elmDataOutput.elementType !== false
+                        && Math.random() < (elmDataOutput.chance ?? 1) ? [elmDataOutput.elementType] : [];
             }
             else {
                 result = elmDataOutput;
@@ -1287,6 +1258,7 @@ globalThis.llElementsPreHook = function () {
         else result = recipe.result;
         /** @type {number[]|false|null} */
         var genResults = globalThis.runtimeRecipeResultGenerate(result);
+        console.log("ll-elements: Spark flame result:", genResults);
         if (typeof genResults === "boolean") return genResults; // if returned a bool, don't run normal handling
         genResults ??= []; // empty array if null
         var newFlame = binding.newElementInstance(globalThis.Hook_ElementType.Flame, cell.x, cell.y);
@@ -1512,12 +1484,13 @@ globalThis.llElementsPreHook = function () {
             "Divider": [30, 100, 50],
             "GoldSoil": [60, 100, 50]
         }
-        var hardcodedDontFix = {
-            // These two are conflicting in vanilla,
-            // so we need to hardcode them to not fix 
-            "Gold": false,
-            "GoldSoil": true,
-        }
+        var hardcodedDontFix = {};
+        // {
+        //     // These two are conflicting in vanilla,
+        //     // so we need to hardcode them to not fix 
+        //     "Gold": false,
+        //     "GoldSoil": true,
+        // }
 
         /** @type {number[]} */
         var darkenList = soilDarkeningLevels.slice();
@@ -1589,6 +1562,9 @@ globalThis.llElementsPreHook = function () {
         for (var [id, soilColors] of Object.entries(r_colorScheme.soil)) {
             var ident = soilTypes[id];
             if (ident === undefined) throw new Error(`ll-elements: SoilType Id ${id} not found!`);
+            if (globalThis.Hook_SoilTypeConfig[id].fog) {
+                continue;
+            }
             for (var i = 0; i < soilColors.length; i++) {
                 var values = soilColors[i];
                 var hslOverride;
@@ -1690,8 +1666,9 @@ globalThis.llElementsPreHook = function () {
             if (entriesSoilType.length > 0) {
                 // find the vanilla soil type that is not modded
                 for (var [id, entries] of entriesSoilType) {
-                    if (!globalThis.ModdedCellTypes[id]) {
-                        entriesSoilType.splice(+id, 1); // remove the entry from the list
+                    if (!globalThis.ModdedCellTypes[+id]) {
+                        var idx = entriesSoilType.findIndex(e => e[0] == +id);
+                        entriesSoilType.splice(idx, 1); // remove the entry from the list
                         done = true;
                         break;
                     }
@@ -1704,8 +1681,9 @@ globalThis.llElementsPreHook = function () {
             else {
                 // Prioritize keeping the vanilla element color over modded ones
                 for (var [id, entries] of entriesElmType) {
-                    if (!globalThis.ModdedElementTypes[id]) {
-                        entriesElmType.splice(+id, 1); // remove the entry from the list
+                    if (!globalThis.ModdedElementTypes[+id]) {
+                        var idx = entriesElmType.findIndex(e => e[0] == +id);
+                        entriesElmType.splice(idx, 1); // remove the entry from the list
                         done = true;
                         break;
                     }

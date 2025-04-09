@@ -1,10 +1,29 @@
 
 exports.modinfo = {
     name: "ll-elements",
-    version: "0.1.0",
+    version: "0.2.0",
     dependencies: [],
     modauthor: "TomTheFurry",
 };
+
+// v.2 updates:
+// - Addexd color conflict resolution
+//   No longer need to worry about color value conflicts with adding stuff!
+//   The lib will now auto-nudge the color values for the conflicting elements/soils
+// - Added Save Data Enhancement
+//   This additional data will be used to help the game load the save data correctly
+//   even if the mod list is changed and ids got shuffled around. Yes, this mean saves
+//   are much more resilient to mod changes, including removals and reorders of mods!
+// - Added Patch Color Overflow
+//   The game engine has an issue where color ids are maxed out at 255, and since each
+//   soil type contains roughly 11 color ids, this would mean that game runs out of ids
+//   really quickly, and will cause corruptions and etc. This patch fixes the issue by
+//   increasing the color id space to a 16 bit space, which is 65536 ids. This means
+//   you can now add more than just 3 to 4 soil types now!
+// - Added hook: launchElementAsParticle(...) - Launch an element as a particle
+// - Bug fixes:
+//   - Fixed physics-crash on vanilla burnable soils getting burned
+//   - Fixed physics-crash on vanilla fog discovery
 
 
 // ==== Headers / Class Defs ====
@@ -19,6 +38,8 @@ class PhysicBinding {
     setElementToPos; // doesn't check for what's there in the target pos
     /** @type {(global, elmA: Element, elmB: Element)=>void} */
     swapTwoElementPosition;
+    /** @type {(global, elm: Element, velocity: {x: number, y: number})=>Particle} */
+    launchElementAsParticle;
 
     /** @type {(cell: Cell)=>boolean} */
     cellIsSolidSoil; // note that fog soils are not solid, but they are soil types
@@ -76,8 +97,20 @@ class PhysicBinding {
  * @typedef {string} CellTypeIdent
  * @typedef {[number, number, number, number]} Rgba
  * @typedef {[number, number, number]} Hsl
- * @typedef {{type: number} | number} Cell
- * @typedef {{type: number, x: number, y: number}} Element
+ * @typedef {Element | number} Cell
+ * @typedef {{
+ *  type: number,
+ *  x: number,
+ *  y: number,
+ *  velocity: {x: number, y: number},
+ *  minVelocity: {x: number, y: number},
+ *  data: object?,
+ *  density: number,
+ *  threshold: {x: number, y: number},
+ *  isFreeFalling: boolean,
+ *  duration: {max: number | -1, left: number},
+ * }} Element
+ * @typedef {{element: Element} & Element} Particle
  * @typedef {{x:number, y:number}} Vec2
  * @typedef {{api: PhysicBinding, global, cell: Element}} PhysicCtx
  * @typedef {PhysicCtx & {otherCell: Element}} InteractionCtx
@@ -106,6 +139,10 @@ const MatterTypes = ["Solid", "Liquid", "Particle", "Gas", "Static", "Slushy", "
 /**
  * @template {PhysicCtx} TCtx
  * @typedef {{key: CellTypeIdent, result: RuntimeRecipeResult | (ctx:TCtx)=>RuntimeRecipeResult}} RuntimeRecipe<TCtx>
+ */
+/**
+ * @template {PhysicCtx} TCtx
+ * @typedef {(ctx:TCtx)=>boolean|void} Event<TCtx>
  */
 
 class CellTypeDefinition {
@@ -140,7 +177,7 @@ class CellTypeDefinition {
 
     /** @type {boolean} */
     // Whether this soil can be broken by bouncers. If not, bouncers with proper upgrades will bounce off this soil
-    soilBouncerBreakable = false;
+    soilBouncerBreakable = false; // todo
     soilDamagableFunction = undefined; // todo
 
     soilIsFog = false;
@@ -169,6 +206,13 @@ class CellTypeDefinition {
     elementMatterState = "Solid";
     /** @type {number?} */
     elementLifeDuration = undefined;
+
+    /** @type {Event?} */
+    // If defined, this function will be called when the element's 'duration' countdown is done
+    // Return false to cancel the element's duration end event letting it tick normally,
+    // Return true to complete duration end event skipping usual actions (normally deleting the element),
+    // or return nothing to continue the end event with usual actions (like deleting the element)
+    elementDurationEndEvent = undefined;
     /** @type {(()=>{data: any})?} */
     elementGetExtraProps = undefined;
     /** @type {boolean} */
@@ -194,11 +238,25 @@ class CellTypeDefinition {
 // ==== Implementation ====
 // #region Implementation
 
-const BaseEndOfCellId = 31 + 9; // 9 as buffer
-const BaseEndOfElementId = 21 + 9; // 9 as buffer
+const BaseEndOfCellId = 31 + 5; // 5 as buffer
+const BaseEndOfElementId = 21 + 5; // 5 as buffer
+// if true, will apply color conflict resolution
+// to prevent different elements mapping to the same color
+// Such cases will causes weird game issues like wrong element behaviors,
+// but atm would not cause crashes or anything like that.
+// Note: This config WILL effect save data, as in save must use the same setting to load correctly
+const ApplyColorConflictResolution = true;
+
+// if true, mod will store the different id mappings to the save data,
+// and leave enough info for later recovery when mod list is changed
+// Note: Nothing is perfect and this is only gonna improve the chance of successful loading of saves
+const AddSaveDataEnhancement = true;
+ // if true, will patch the color id overflow issue in the game 
+const PatchColorIdOverflow = true;
 
 class LibElementsApi /** @implements {LibApi} */ {
     id = "LibElementsApi";
+    version = "2.0.0";
     /** @type {Recipe<PhysicCtx>[]} */
     KineticRecipes = [];
     /** @type {Recipe<InteractionCtx>[]} */
@@ -244,6 +302,7 @@ class LibElementsApi /** @implements {LibApi} */ {
                 clearCell:                 ["Ud", "Nz", "Nz"],
                 setElementToPos:           ["zd", "L3", "L3"],
                 swapTwoElementPos:         ["jd", "Hc", "Hc"],
+                launchElementAsParticle:   ["oe", ["J","i"], ["J", "o"]],
                 cellIsSolidSoil:           ["Wd", "Br", "Br"],
                 cellIsSoilType:            ["Xd", "ez", "ez"],
                 cellIsElement:             ["$d", "Bp", "Bp"],
@@ -289,6 +348,7 @@ class LibElementsApi /** @implements {LibApi} */ {
             bindingMake("clearCell");
             bindingMake("setElementToPos");
             bindingMake("swapTwoElementPos");
+            bindingMake("launchElementAsParticle");
             bindingMake("cellIsSolidSoil");
             bindingMake("cellIsSoilType");
             bindingMake("cellIsElement");
@@ -364,7 +424,8 @@ class LibElementsApi /** @implements {LibApi} */ {
             var specialColorVarientFuncsMap = {}; // id => function
             var elmColorsMap = {}; // id => colors
             var elmBaseHuesMap = {}; // id => hue (0-360)
-            var elmLiquidsIds = []; // todo
+            var elmFluidsIds = []; // id list
+            var elmOnTimerEndCallbacks = {}; // id => function
             { // Validate and patch in the base element configs
                 var configCopy = [];
                 for (var i = 0; i < elementCellTypes.length; i++) {
@@ -407,6 +468,13 @@ class LibElementsApi /** @implements {LibApi} */ {
                         }
                     }
                     elmBaseHuesMap[ct.id] = ct.elementHueHint;
+                    if (ct.elementMatterState == "Liquid" || ct.elementMatterState == "Gas") {
+                        elmFluidsIds.push(ct.id);
+                    }
+                    if (ct.elementDurationEndEvent) {
+                        elmOnTimerEndCallbacks[ct.id] = ct.elementDurationEndEvent;
+                    }
+
                     var elmDef = {
                         name: ct.displayName ?? ct.id,
                         ident: ct.id,
@@ -441,6 +509,12 @@ class LibElementsApi /** @implements {LibApi} */ {
                     {"main":["e"],"336":["e"],"546":["e"]},
                     (l) => `${l}[${l}.Wisp`,
                     (l) => `(globalThis.Hook_MatterType??=${l}),${l}[${l}.Wisp`
+                );
+                // add to the fluid list
+                ll.AddPatternPatches(
+                    {"main": ["n", "ne"], "336": ["a.RJ", "d"], "546": ["r.RJ", "u"]},
+                    (elmType, l) => `${l}=[${elmType}.Water,`,
+                    (elmType, l) => `${l}=[${elmFluidsIds.map(v=>`${elmType}.${v},`).join("")}${elmType}.Water,`,
                 );
             }
             { // patch in color fields
@@ -512,6 +586,29 @@ class LibElementsApi /** @implements {LibApi} */ {
                             }${l}[${elmType}.Sandium]=6`
                     );
                 }
+            }
+
+            { // patch in the timer callbacks
+                var callbacksFormatted = [];
+                for (var [elmId, func] of Object.entries(elmOnTimerEndCallbacks)) {
+                    if (!(func instanceof Function)) throw new Error(`ll-elements: Element ${elmId} duration end callback is not a function!`);
+                    callbacksFormatted.push({key: elmId, func: `return ${func.toString()}`});
+                }
+                var jsonCallbacks = JSON.stringify(callbacksFormatted);
+                ll.AddInjectionToScriptHeading(`globalThis.ElementDurationEndCallbacksSource = ${jsonCallbacks};`);
+                // patch the updateCellTimer code to the hook
+                ll.AddPatternPatches(
+                    {"336":["e","t","r"]},
+                    (glb,elm,dt) => `){return!(-1===${elm}.duration.max||(${elm}.duration.left-=${dt},`,
+                    (glb,elm,dt) => `){
+                        if (${elm}.duration.max == -1) return;
+                        ${elm}.duration.left -= ${dt};
+                        if (${elm}.duration.left <= 0) {
+                            var bVal = globalThis.hookOnElementDurationEndCallback(${glb},${elm},${dt});
+                            if (bVal) return bVal;
+                        }
+                        return!((`,
+                );
             }
         }
         // then, soil defs
@@ -615,8 +712,7 @@ class LibElementsApi /** @implements {LibApi} */ {
                     (cType,eType,fog,x,y,ne) => `return ${fog}===${cType}.FogWater?${ne}(${eType}.Water,${x},${y})`,
                     (cType,eType,fog,x,y,ne) => `return ${
                     Object.entries(soilFogToResultMapping).map(([fogId, elmType]) =>
-                        `${fog}===${cType}.${fogId}?${ne}(${eType}.${elmType},${x},${y}):\n`).join("")}
-                    ${fog}===${cType}.FogWater?${ne}(${eType}.Water,${x},${y})`
+                        `${fog}===${cType}.${fogId}?${ne}(${eType}.${elmType},${x},${y}):\n`).join("")}${fog}===${cType}.FogWater?${ne}(${eType}.Water,${x},${y})`
                 );
             }
         }
@@ -720,6 +816,162 @@ class LibElementsApi /** @implements {LibApi} */ {
                 );
             }
         }
+        
+        if (PatchColorIdOverflow) {
+            // patch the overflow (1 byte per colorId) by using a 16 byte (ushort) instead
+            // Fist patch the alloc size
+            ll.AddPatternPatches(
+                {"main": ["u"]},
+                (mapData) => `${mapData}=new SharedArrayBuffer(`,
+                (mapData) => `${mapData}=new SharedArrayBuffer(2*`,
+            );
+            // Next, patch the 'view' array constructor
+            ll.AddPatternPatches(
+                {"main": [], "336": []},
+                () => `mapData:{data:new Uint8Array(`,
+                () => `mapData:{data:new Uint16Array(`,
+            );
+            // Then, patch the color id generation such that instead of counting down from 252(or something),
+            // it counts from leftover of elm used color ids, and skip over special ids.
+            ll.AddPatternPatches(
+                {"main": ["a","i"]},
+                (v,t) => `.elementColorByColorId,${v}=(`,
+                // note: >100 is needed as shader hardcoded solid grounds to be 100+
+                (v,t) => `.elementColorByColorId, _startingColorId=Math.max(${t}.colorId,100),${v}=(`
+            );
+            ll.AddPatternPatches(
+                {"main": ["M","o"]},
+                (clrIds,clrId) => `${clrId}=${clrIds}.ObstacleStart;`,
+                (clrIds,clrId) => `${clrId}=_startingColorId+1;` // leave 1 gap just in case.
+            );
+            ll.AddPatternPatches(
+                {"main": ["M","o"]},
+                (clrIds,clrId) => `,${clrId}--`,
+                (clrIds,clrId) => `,(()=>{do {${clrId}++} while (Object.keys(${clrIds}).includes(""+${clrId}))})(),${clrId}`,
+                5
+            );
+            // Also need to update GL texture type to be 8 bit RG
+            ll.AddPatches([
+                { // Make the texture type to be 8 bit RG instead of 8 bit R, and update buf size
+                    type: "replace",
+                    from: "R=new Uint8Array(P.width*P.height),I=Rr.fromBuffer(R,P.width,P.height,{format:fe.RED,type:me.UNSIGNED_BYTE})",
+                    to: "R=new Uint8Array(P.width*P.height*2),I=Rr.fromBuffer(R,P.width,P.height,{format:fe.RG,type:me.UNSIGNED_BYTE})",
+                    expectedMatches: 1,
+                },
+                { // Have the setter cast the buffer to byte array
+                    type: "replace",
+                    from: "r.pixi.tilemap.set(c)",
+                    to: `r.pixi.tilemap.set(new Uint8Array(c.buffer))`,
+                    expectedMatches: 1,
+                },
+                { // Update the clrIdLookup texture func to go though all color ids
+                    type: "replace",
+                    from: "(e,t,n){var r=M.Darkness+1,",
+                    to: `(e,t,n){var r = Math.max(M.Darkness,...Object.keys(n).map(Number))+1,`,
+                    expectedMatches: 1,
+                },
+                { // update the shader to use both r and g channel, combining them to 16 bit val
+                    type: "replace",
+                    from: "float getTileValue(vec2 coord, sampler2D texture)",
+                    to: `${JSON.stringify(`
+                        float getTileValue(vec2 coord, sampler2D texture)
+                        {
+                            // Normalizing to [0, 1] and flipping y-coordinate
+                            vec2 relativeCoord = vec2(coord.x / uResolution.x, (uResolution.y - coord.y) / uResolution.y);
+                            // Scaling to tilemap size
+                            vec2 tilemapCoord = relativeCoord * uTilemapSize;
+                            // Adjust the tilemap coordinates by the camera position offset
+                            vec2 cameraOffset = mod(uCameraPosition, vec2(4.0));
+                            tilemapCoord += cameraOffset / uResolution * uTilemapSize;
+                            vec2 tileCoord = floor(tilemapCoord);
+
+                            vec4 tileClr = texture2D(texture, (tileCoord + vec2(0.5)) / uTilemapSize);
+                            float tileLow = tileClr.r;
+                            float tileHigh = tileClr.g;
+                            float tileValueLow = tileLow * 255.0;
+                            float tileValueHigh = tileHigh * 255.0 * 256.0;
+                            return tileValueLow + tileValueHigh;
+                        }`).slice(1,-1)}\\nfloat getTileValueOld(vec2 coord, sampler2D texture)`,
+                    expectedMatches: 1,
+                },
+                { // have the wall tilemap use old func instead of the new one, as that aren't changed
+                    type: "replace",
+                    from: "getTileValue(gl_FragCoord.xy, uWallTilemapTexture)",
+                    to: `getTileValueOld(gl_FragCoord.xy, uWallTilemapTexture)`,
+                    expectedMatches: 1,
+                },
+                { // insert the runtime-shader-compile-time replace tag for setting thee lookup count
+                    type: "replace",
+                    from: "(tileValue + 0.5) / 255.0;",
+                    to: `(tileValue + 0.5) / ##COLORID_LOOKUP_TEXTURE_WIDTH##;`,
+                    expectedMatches: 1,
+                },
+                { // apply the runtime-shader-compile-time replacement to the shader string
+                    type: "replace",
+                    from: `;\\n}",{uResolution:[o.width,o.height],minLightAmount`,
+                    to: `;\\n}"
+                    .replace("##COLORID_LOOKUP_TEXTURE_WIDTH##", \`\${N.baseTexture.width}.0\`)
+                    ,{uResolution:[o.width,o.height],minLightAmount`,
+                    expectedMatches: 1,
+                },
+                { // update the blitting func to have a 16 bit varient
+                    type: "replace",
+                    from: `function Pf(e,t,n,r,i,s){`,
+                    to: `
+                    function Pf_16Bit(e_buff, t_ox, n_oy, r_w, i_h, s_stride) {
+                        for (var o = new Uint16Array(r_w * i_h),
+                            a_row = 0; a_row < i_h; a_row++) {
+                            var l_rowStartIdx = (n_oy + a_row) * s_stride + t_ox,
+                                u_rowEndIdx = l_rowStartIdx + r_w;
+                            o.set(e_buff.subarray(l_rowStartIdx, u_rowEndIdx), a_row * r_w)
+                        }
+                        return o
+                    }
+                    function Pf(e,t,n,r,i,s){`,
+                    expectedMatches: 1,
+                },
+                { // and have the map data tilemap use the 16 bit version
+                    type: "replace",
+                    from: "c=Pf(n.shared.mapData.data,",
+                    to: `c=Pf_16Bit(n.shared.mapData.data,`,
+                    expectedMatches: 1,
+                },
+            ]);
+        }
+
+        if (ApplyColorConflictResolution) {
+            // patch the color conflict resolution code to dynamically shift color values in color scheme if config is enabled
+            ll.AddPatternPatches(
+                {"main": ["pu", "wu"]},
+                (h,d) => `={element:(`,
+                (h,d) => `=globalThis.callPostAssign(s=>globalThis.patchResolveColorConflicts(s, ${h}, ${d})).trigger={element:(`
+            );
+        }
+        else {
+            ll.AddPatternPatches(
+                {"main": ["pu", "wu"]},
+                (h,d) => `={element:(`,
+                (h,d) => `=globalThis.callPostAssign(s=>{debugger;}).trigger={element:(`
+            );
+        }
+
+        if (AddSaveDataEnhancement)
+        {
+            // First, add the hook call on end of loading a save, which dumps out needed data
+            // for future recoveries
+            ll.AddPatternPatches(
+                {"main": ["f", "QT", "s"]},
+                (v1,f1,glb) => `${v1}=${f1}(${glb},`,
+                (v1,f1,glb) => `globalThis.hookOnLoadSaveEndInjectEnhancement(${glb}),${v1}=${f1}(${glb},`,
+            );
+            // Alternative
+            ll.AddPatternPatches(
+                {"main": ["e","r.data"]}, // note: not using 't' cause that got shadowed.
+                (cell,store) => `{return Array.isArray(${cell})?{cellType:${cell}[0],hp:${cell}[1]}`,
+                (cell,store) => `{${cell}=globalThis.hookSaveEnhancementPatchValue(${store},${cell});return Array.isArray(${cell})?{cellType:${cell}[0],hp:${cell}[1]}`,
+            );
+        }
+
     };
 }
 
@@ -786,6 +1038,27 @@ globalThis.llElementsPreHook = function () {
                 computed[keyId] = recipe;
             }
             console.log(`ll-elements: ${recipeType}Recipes computed:`, computed);
+            return computed;
+        }
+    }
+
+    var genericFixCallbacks = (callbacksType, additionalFixer) => {
+        return () => {
+            console.log(`ll-elements: Evaluating ${callbacksType}...`);
+            var source = globalThis[`${callbacksType}Source`];
+            if (!source) throw new Error(`ll-elements: ${callbacksType}Source not found!`);
+            var ids = globalThis.Hook_ElementType;
+            var computed = {};
+            for (var callback of source) {
+                var keyId = ids[callback.key];
+                if (keyId === undefined) throw new Error(`ll-elements: Element type ${callback.key} not found!`);
+                if (computed[keyId]) throw new Error(`ll-elements: Multiple ${callbacksType} for ${callback.key} exists!`);
+                callback.key = keyId;
+                callback.func = new Function(callback.func)(); // should return a func 
+                additionalFixer?.(callback);
+                computed[keyId] = callback;
+            }
+            console.log(`ll-elements: ${callbacksType} computed:`, computed);
             return computed;
         }
     }
@@ -934,7 +1207,8 @@ globalThis.llElementsPreHook = function () {
         if (elmDataOutput) {
             var result;
             if (!Array.isArray(elmDataOutput)) {
-                result = Math.random() < (elmDataOutput.chance ?? 1) ? [elmDataOutput.elementType] : []; 
+                    result = elmDataOutput.elementType !== false
+                        && Math.random() < (elmDataOutput.chance ?? 1) ? [elmDataOutput.elementType] : [];
             }
             else {
                 result = elmDataOutput;
@@ -984,6 +1258,7 @@ globalThis.llElementsPreHook = function () {
         else result = recipe.result;
         /** @type {number[]|false|null} */
         var genResults = globalThis.runtimeRecipeResultGenerate(result);
+        console.log("ll-elements: Spark flame result:", genResults);
         if (typeof genResults === "boolean") return genResults; // if returned a bool, don't run normal handling
         genResults ??= []; // empty array if null
         var newFlame = binding.newElementInstance(globalThis.Hook_ElementType.Flame, cell.x, cell.y);
@@ -1084,23 +1359,38 @@ globalThis.llElementsPreHook = function () {
         return false;
     };
 
+    globalThis.lazyPropSet(globalThis, "ElementDurationEndCallbacks", genericFixCallbacks("ElementDurationEndCallbacks"));
+
+    globalThis.hookOnElementDurationEndCallback = (global, elm, dt) => {
+        /** @type {PhysicBinding} */
+        var binding = globalThis.physicsBindingApi;
+        var durationCallbacks = globalThis.ElementDurationEndCallbacks;
+        var callback = durationCallbacks[elm.type];
+        if (!callback) return; // no mapped callback for this element. continue as normal
+        var result = callback.func({api:binding, global:global, cell:elm, dt:dt});
+        return result; // maps perfectly to the injection handling,
+        // where true/false terminates the func, while 'undefined' continues the func
+    };
+
     // setup global functions for use in patches
     globalThis.patchCellTypeIds = (list, newIds) => {
         globalThis.Hook_CellType ??= list;
+        var modded = globalThis.ModdedCellTypes = [];
         console.log("patching cell type ids, adding newIds:", newIds);
         for (var i = 0; i < newIds.length; i++) {
-            list[newIds[i][0]] = newIds[i][1];
-            list[newIds[i][1]] = newIds[i][0];
+            modded[newIds[i][0]] = list[newIds[i][0]] = newIds[i][1];
+            modded[newIds[i][1]] = list[newIds[i][1]] = newIds[i][0];
         }
         console.log("patched cell type ids, result:", list);
     }
 
     globalThis.patchElementTypeIds = (list, newIds) => {
         globalThis.Hook_ElementType ??= list;
+        var modded = globalThis.ModdedElementTypes = [];
         console.log("patching element type ids, adding newIds:", newIds);
         for (var i = 0; i < newIds.length; i++) {
-            list[newIds[i][0]] = newIds[i][1];
-            list[newIds[i][1]] = newIds[i][0];
+            modded[newIds[i][0]] = list[newIds[i][0]] = newIds[i][1];
+            modded[newIds[i][1]] = list[newIds[i][1]] = newIds[i][0];
         }
         console.log("patched element type ids, result:", list);
     }
@@ -1174,6 +1464,861 @@ globalThis.llElementsPreHook = function () {
             list[rawCfg.idx] = cfg;
             console.log("patched soil type config, result:", list);
         }
+    }
+
+    globalThis.patchResolveColorConflicts = (originalColorScheme, hslFunc, soilDarkeningLevels) => {
+
+        /**
+         * @type {{
+         *  element: {[elmId: number]: [Rgba] | [Rgba, Rgba, Rgba, Rgba]},
+         *  soil: {[soilId: number]: [Hsl, Rgba, Rgba]},
+         * }}
+         * 
+         */
+        var r_colorScheme = originalColorScheme;
+        /** @type {(hue:number, sat:number, light:number)=>Rgba} */
+        var hsl2rgb = hslFunc;
+        var hardcodedSoilHsl = {
+            "Bedrock": [0, 0, 66],
+            "Ice": [199, 99, 90],
+            "Divider": [30, 100, 50],
+            "GoldSoil": [60, 100, 50]
+        }
+        var hardcodedDontFix = {};
+        // {
+        //     // These two are conflicting in vanilla,
+        //     // so we need to hardcode them to not fix 
+        //     "Gold": false,
+        //     "GoldSoil": true,
+        // }
+
+        /** @type {number[]} */
+        var darkenList = soilDarkeningLevels.slice();
+        darkenList.splice(0, 0, 1) // add '1' to the start of the list
+
+        /**
+         *  @typedef {{
+         *  isElm: boolean,
+         *  id: number,
+         *  ident: string,
+         *  colorVarientId: number,
+         *  soilDarkening?: number,
+         * }} Entry
+         * */
+        /** @type {{[key: string]: Entry[]}}} */
+        var mappings = {};
+        var elmTypes = globalThis.Hook_ElementType;
+        var soilTypes = globalThis.Hook_CellType;
+        /** @type {(Rgba) => string} */
+        const colorToStr = (color) => `${color[0]} ${color[1]} ${color[2]} ${color[3]}`;
+        /** @type {(string) => Rgba} */
+        const strToColor = (colorStr) => colorStr.split(" ").map(Number);
+        const isValidRgba = (color) => !isNaN(color[0]) && !isNaN(color[1]) && !isNaN(color[2]) && !isNaN(color[3]);
+
+        /** @type {(startArray: number[], limits: number[] validCondition: (array: number[]) => boolean) => number[]} */
+        const valueShift = (startArray, limits, validCondition) => {
+            var frontLists = [startArray];
+            var checked = {};
+            checked[startArray.join(",")] = true;
+            while (frontLists.length > 0) {
+                var front = frontLists.splice(0, 1)[0]; // pop the first element
+                if (validCondition(front)) {
+                    return front;
+                }
+                var len = front.length;
+                for (var i = 0; i < len; i++) {
+                    var key;
+                    var newFront = front.slice();
+                    newFront[i] = (newFront[i] + 1);
+                    if (newFront[i] <= limits[i] && (key = newFront.join(","), !checked[key])) {
+                        checked[key] = true;
+                        frontLists.push(newFront);
+                    }
+                    var newFront = front.slice();
+                    newFront[i] = (newFront[i] - 1);
+                    if (newFront[i] >= 0 && (key = newFront.join(","), !checked[key])) {
+                        checked[key] = true;
+                        frontLists.push(newFront);
+                    }
+                }
+            } // else return undefined
+        }
+
+        for (var [elmId, elmColors] of Object.entries(r_colorScheme.element)) {
+            var ident = elmTypes[elmId];
+            if (ident === undefined) throw new Error(`ll-elements: ElementType Id ${elmId} not found!`);
+            for (var i = 0; i < elmColors.length; i++) {
+                var rgba = elmColors[i];
+                var isValid = isValidRgba(rgba);
+                if (!isValid) {
+                    console.log(`ll-elements: Element ${ident} varient #${i} color is not valid!`, rgba);
+                    continue;
+                }
+                var color = colorToStr(rgba);
+                var entries = mappings[color] ??= (mappings[color] = []);
+                entries.push({isElm: true, id: elmId, ident: ident, colorVarientId: i});
+            }
+        }
+        for (var [id, soilColors] of Object.entries(r_colorScheme.soil)) {
+            var ident = soilTypes[id];
+            if (ident === undefined) throw new Error(`ll-elements: SoilType Id ${id} not found!`);
+            if (globalThis.Hook_SoilTypeConfig[id].fog) {
+                continue;
+            }
+            for (var i = 0; i < soilColors.length; i++) {
+                var values = soilColors[i];
+                var hslOverride;
+                if ((hslOverride = hardcodedSoilHsl[ident])) {
+                    values = hslOverride;
+                    if (i != 0) {
+                        continue; // hardcoded soil only has 1 color varient
+                    }
+                }
+                if (values.some(isNaN)) {
+                    console.log(`ll-elements: Soil ${ident} varient #${i} color is not valid!`, values);
+                    continue;
+                }
+                if (values.length == 3) {
+                    for (var darkening of darkenList) {
+                        var rgb = hsl2rgb(values[0], values[1], values[2] * darkening);
+                        var color = colorToStr(rgb);
+                        var entries = mappings[color] ??= (mappings[color] = []);
+                        entries.push({isElm: false, id: id, ident: ident, colorVarientId: i, soilDarkening: darkening});
+                    }
+                }
+                else if (values.length == 4) {
+                    var color = colorToStr(rgb);
+                    var entries = mappings[color] ??= [];
+                    entries.push({isElm: false, id: id, ident: ident, colorVarientId: i});
+                }
+                else {
+                    console.log(`ll-elements: Soil ${ident} varient #${i} color is not valid!`, values);
+                    continue;
+                }
+            }
+        }
+        // scan for list with more than 1 entry
+        var colorUniqueConflictCount = 0;
+        var colorTotalConflictCount = 0;
+        var totalColorCount = 0;
+        var uniqueColorCount = 0;
+        var changedEntriesCount = 0;
+
+        /**
+         *  @type {{[colorKey: string]: {
+         *  bySoil: [keyNumber: string, Entry[]][],
+         *  byElm: [keyNumber: string, Entry[]][],
+         * }}}
+         * */
+        var grouppedMappingsWithConflicts = {};
+
+        /** @type {{[key: number]: {[vId: number]: true}}} */
+        var soilsWithDarkeningToFix = {};
+
+        // Note: Sort is needed to ensure consistent order of entries.
+        for (var [color, entries] of Object.entries(mappings).sort((a, b) => a.displayName > b.displayName ? 1 : -1)) {
+            totalColorCount += entries.length;
+            uniqueColorCount++;
+            //assert(entries.length > 0, "ll-elements: unexpected error in resolveColorConflicts");
+            if (entries.length == 1) continue; // no conflict here
+            /** @type {{[key: number]: Entry[]}} */
+            var entriesBySoilType = {};
+            /** @type {{[key: number]: Entry[]}} */
+            var entriesByElmType = {};
+            for (var i = 0; i < entries.length; i++) {
+                var entry = entries[i];
+                if (entry.isElm) {
+                    var elmEntries = entriesByElmType[entry.id] ??= (entriesByElmType[entry.id] = []);
+                    elmEntries.push(entry);
+                }
+                else {
+                    var soilEntries = entriesBySoilType[entry.id] ??= (entriesBySoilType[entry.id] = []);
+                    soilEntries.push(entry);
+                }
+            }
+            var uniqueMappingCount = Object.keys(entriesBySoilType).length + Object.keys(entriesByElmType).length;
+            if (uniqueMappingCount == 1) continue; // no conflict here, just a single mapping
+            // conflict here, so we need to resolve it
+            console.log("ll-elements: Color conflict detected for color:", color, "Following entries mapped to it:");
+            colorUniqueConflictCount++;
+            // print the entries
+            var entriesSoilType = Object.entries(entriesBySoilType).sort((a, b) => +a[0] - +b[0]);
+            var entriesElmType = Object.entries(entriesByElmType).sort((a, b) => +a[0] - +b[0]);
+
+            var combined = entriesSoilType.concat(entriesElmType);
+            for (var [id, entries] of combined) {
+                for (var i = 0; i < entries.length; i++) {
+                    var entry = entries[i];
+                    if (entry.isElm) {
+                        var elmEntry = entry;
+                        console.log(`Element#${elmEntry.id} (${elmEntry.ident}), color varient #${elmEntry.colorVarientId}`);
+                    }
+                    else {
+                        var soilEntry = entry;
+                        console.log(`Soil#${soilEntry.id} (${soilEntry.ident}), color varient #${soilEntry.colorVarientId} ${ soilEntry.soilDarkening ? `, darkening #${soilEntry.soilDarkening}` : ""}`);
+                    }
+                }
+                colorTotalConflictCount++;
+            }
+            // now, select the one that get to keep this color
+            // Soil has priority over elements, as changing soil color is very difficult
+            var done = false;
+            if (entriesSoilType.length > 0) {
+                // find the vanilla soil type that is not modded
+                for (var [id, entries] of entriesSoilType) {
+                    if (!globalThis.ModdedCellTypes[+id]) {
+                        var idx = entriesSoilType.findIndex(e => e[0] == +id);
+                        entriesSoilType.splice(idx, 1); // remove the entry from the list
+                        done = true;
+                        break;
+                    }
+                }
+                if (!done) {
+                    // else, just use the first one
+                    entriesSoilType.splice(0, 1); // remove the entry from the list
+                }
+            }
+            else {
+                // Prioritize keeping the vanilla element color over modded ones
+                for (var [id, entries] of entriesElmType) {
+                    if (!globalThis.ModdedElementTypes[+id]) {
+                        var idx = entriesElmType.findIndex(e => e[0] == +id);
+                        entriesElmType.splice(idx, 1); // remove the entry from the list
+                        done = true;
+                        break;
+                    }
+                }
+                if (!done) {
+                    // else, just use the first one
+                    entriesElmType.splice(0, 1); // remove the entry from the list
+                }
+            }
+            if (entriesSoilType.length > 0) {
+                var idVarsRemoved = [];
+                var d = entriesSoilType.map(e => [e[0], e[1].filter(e => !!e.soilDarkening)]).filter(e => e[1].length > 0);
+                for (var [id, entries] of d) {
+                    var cVarients = {};
+                    var _ = entries.map(e => cVarients[e.colorVarientId] = true);
+                    var uniqueVars = Object.keys(cVarients).map(Number);
+                    _ = uniqueVars.map(e => (soilsWithDarkeningToFix[+id] ??= [])[e] = true);
+                    idVarsRemoved.push([+id, uniqueVars]);
+                }
+                for (var [id, vars] of idVarsRemoved) {
+                    var toUpdateIdx = entriesSoilType.findIndex(e => e[0] == id);
+                    if (toUpdateIdx < 0) throw new Error(`ll-elements: Unexpected error in resolveColorConflicts`);
+                    var remIdx;
+                    while ((remIdx = entriesSoilType[toUpdateIdx][1].findIndex(e => vars.includes(e.colorVarientId))) >= 0) {
+                        entriesSoilType[toUpdateIdx][1].splice(remIdx, 1); // remove the entry
+                    }
+                    if (entriesSoilType[toUpdateIdx][1].length == 0) {
+                        entriesSoilType.splice(toUpdateIdx, 1); // remove the entry
+                    }
+                }
+            }
+            if (entriesElmType.length + entriesSoilType.length == 0) continue;
+            grouppedMappingsWithConflicts[color] = {
+                bySoil: entriesSoilType,
+                byElm: entriesElmType,
+            }
+        }
+
+        // Now, first, unlist all the darkening entries
+        for (var [keyId, vars] of Object.entries(soilsWithDarkeningToFix)) {
+            if (hardcodedDontFix[soilTypes[keyId]]) continue; // don't fix this one
+            for (var varId of Object.keys(vars).map(Number)) {
+                var originalHsl = r_colorScheme.soil[+keyId][varId];
+                if (originalHsl.length != 3) throw new Error(`ll-elements: Unexpected error in resolveColorConflicts`);
+                //  we need to update the list of mappings and such to free up the color
+                var oldColorStrs = darkenList.map(darken => [colorToStr(hsl2rgb(originalHsl[0], originalHsl[1], originalHsl[2] * darken)), darken]);
+                for (var i = 0; i < oldColorStrs.length; i++) {
+                    changedEntriesCount++;
+                    var oldColorStr = oldColorStrs[i][0];
+                    var oldMappingEntries = mappings[oldColorStr];
+                    if (!oldMappingEntries) throw new Error(`ll-elements: Unexpected error in resolveColorConflicts`);
+                    var idx = oldMappingEntries.findIndex(e => e.id == +keyId && e.colorVarientId == varId && e.soilDarkening == oldColorStrs[i][1] && e.isElm == false);
+                    if (idx < 0) throw new Error(`ll-elements: Unexpected error in resolveColorConflicts`);
+                    if (oldMappingEntries.length == 1) {
+                        delete mappings[oldColorStr]; // remove the mapping
+                    }
+                    else {
+                        oldMappingEntries.splice(idx, 1); // remove the entry
+                    }
+                    // also fix the grouppedMappingsWithConflicts
+                    // note: That list never contains darkening entries, so we know we are not in there
+                    var pair = grouppedMappingsWithConflicts[oldColorStr];
+                    if (!pair) continue; // no need to fix this one (it only contained darkening entries)
+                    if (pair.bySoil.length + pair.byElm.length != 1) continue; // can't do anything here
+                    // otherwise, just remove the conflict entry as we resolved it
+                    delete grouppedMappingsWithConflicts[oldColorStr]; // remove the entry as its resolved
+                }
+            }
+        }
+        
+        // Then, assign back new colors to the darkening entries
+        for (var [keyId, vars] of Object.entries(soilsWithDarkeningToFix)) {
+            if (hardcodedDontFix[soilTypes[keyId]]) continue; // don't fix this one
+            for (var varId of Object.keys(vars).map(Number)) {
+                var originalHsl = r_colorScheme.soil[+keyId][varId];
+                if (originalHsl.length != 3) throw new Error(`ll-elements: Unexpected error in resolveColorConflicts`);
+
+                var newHsl = valueShift(originalHsl, [360, 100, 100], (hsl) => {
+                    var rgbs = darkenList.map(darken => hsl2rgb(hsl[0], hsl[1], hsl[2] * darken));
+                    var colorStrs = rgbs.map(color => colorToStr(color));
+                    return colorStrs.every(colorStr => !mappings[colorStr]);
+                });
+                if (!newHsl) throw new Error(`ll-elements: Color conflict resolution failed! No remaining unused color found!`);
+
+                console.log(`ll-elements: Color conflict resolution for soil ${soilTypes[keyId]} primary hsl:`, originalHsl, `->`, newHsl);
+
+                // actually update the color
+                for (var darken of darkenList) {
+                    var rgb = hsl2rgb(newHsl[0], newHsl[1], newHsl[2] * darken);
+                    var newColorStr = colorToStr(rgb);
+                    if (mappings[newColorStr]) throw new Error(`ll-elements: Color conflict resolution failed! Color already exists!`);
+                    mappings[newColorStr] = [{isElm: false, id: keyId, ident: soilTypes[keyId], colorVarientId: varId, soilDarkening: darken}];
+                }
+                r_colorScheme.soil[+keyId][varId] = newHsl; // update the color
+            }
+        }
+
+        // now, fix the easier rgba conflicts
+        for (var [color, conflictEntries] of Object.entries(grouppedMappingsWithConflicts).sort((a, b) => (+a[0]) - (+b[0]))) {
+            var currentColor = strToColor(color);
+            for (var [soilId, soilEntries] of conflictEntries.bySoil) {
+                if (hardcodedDontFix[soilTypes[soilId]]) continue; // don't fix this one
+                var toShift = [currentColor[0], currentColor[1], currentColor[2]]; // don't want to change alpha
+                var result = valueShift(toShift, [255, 255, 255], (rgb) => {
+                    var colorStr = colorToStr([rgb[0], rgb[1], rgb[2], 255]);
+                    if (mappings[colorStr]) return false;
+                    return true; 
+                });
+                if (!result) {
+                    throw new Error(`ll-elements: Color conflict resolution failed! No remaining unused color found!`);
+                }
+                console.log(`ll-elements: Color conflict resolution for soil ${soilTypes[soilId]} color:`, toShift, `->`, result);
+                var newRgba = [result[0], result[1], result[2], 255];
+                for (var j = 0; j < soilEntries.length; j++) {
+                    var elmEntry = soilEntries[j];
+                    r_colorScheme.soil[elmEntry.id][elmEntry.colorVarientId] = newRgba;
+                    changedEntriesCount++;
+                }
+                // update the mapping to the new color
+                var cutout = [];
+                var mappingIdx;
+                while ((mappingIdx = mappings[color].findIndex(e => e.id == +soilId && e.isElm == false)) >= 0) {
+                    cutout.push(mappings[color].splice(mappingIdx, 1)[0]); // remove the entry
+                }
+                if (cutout.length < 1) throw new Error(`ll-elements: Unexpected error in resolveColorConflicts`);
+                var newColorStr = colorToStr(newRgba);
+                if (mappings[newColorStr]) throw new Error(`ll-elements: Color conflict resolution failed! Color already exists!`);
+                mappings[newColorStr] = cutout; // add the new color mapping
+            }
+            for (var [elmId, elmEntries] of conflictEntries.byElm) {
+                if (hardcodedDontFix[elmTypes[elmId]]) continue; // don't fix this one
+                var toShift = [currentColor[0], currentColor[1], currentColor[2]]; // don't want to change alpha
+                var result = valueShift(toShift, [255, 255, 255], (rgb) => {
+                    var colorStr = colorToStr([rgb[0], rgb[1], rgb[2], 255]);
+                    if (mappings[colorStr]) return false;
+                    return true; 
+                });
+                if (!result) {
+                    throw new Error(`ll-elements: Color conflict resolution failed! No remaining unused color found!`);
+                }
+                console.log(`ll-elements: Color conflict resolution for element ${elmTypes[elmId]} color:`, toShift, `->`, result);
+                var newRgba = [result[0], result[1], result[2], 255];
+                for (var j = 0; j < elmEntries.length; j++) {
+                    var elmEntry = elmEntries[j];
+                    r_colorScheme.element[elmEntry.id][elmEntry.colorVarientId] = newRgba;
+                    changedEntriesCount++;
+                }
+                // update the mapping to the new color
+                var cutout = [];
+                var mappingIdx;
+                while ((mappingIdx = mappings[color].findIndex(e => e.id == +elmId && e.isElm == true)) >= 0) {
+                    cutout.push(mappings[color].splice(mappingIdx, 1)[0]); // remove the entry
+                }
+                if (cutout.length < 1) throw new Error(`ll-elements: Unexpected error in resolveColorConflicts`);
+                var newColorStr = colorToStr(newRgba);
+                if (mappings[newColorStr]) throw new Error(`ll-elements: Color conflict resolution failed! Color already exists!`);
+                mappings[newColorStr] = cutout; // add the new color mapping
+            }
+        }
+
+        var remainingConflicts = Object.entries(mappings)
+            .map(p => [p[0], p[1]
+                .reduce((rv, x)=>((rv[x.ident]??=[]).push(x),rv),{})])
+            .map(p => [p[0], Object.entries(p[1])])
+            .filter(p => p[1].length > 1);
+        console.log("ll-elements: Remaining conflicts:", remainingConflicts);
+        var stats = {
+            totalColorCount: totalColorCount,
+            uniqueColorCount: uniqueColorCount,
+            colorUniqueConflictCount: colorUniqueConflictCount,
+            colorTotalConflictCount: colorTotalConflictCount,
+            changedEntriesCount: changedEntriesCount,
+            newUniqueColorCount: Object.keys(mappings).length,
+        }
+        console.log("ll-elements: Color conflict resolution stats:", stats);
+        //debugger;
+        
+        return stats;
+    }
+
+    globalThis.hookSaveEnhancementPatchValue = (store, cell) => {
+        var cache = store.Mod_SaveDataEnhancement_LoadingCache;
+        if (!cache) {
+            var cache = store.Mod_SaveDataEnhancement_LoadingCache = {};
+            cache.enabled = false;
+            if (!store.Mod_SaveDataEnhancement) {
+                console.info("ll-elements: Save file's enhancement data does not exist. Skipping save-data-id-patching.");
+                return cell;
+            }
+            var dataToAdd = store.Mod_SaveDataEnhancement;
+            if (dataToAdd.enhancementVersion > 0) {
+                console.warn("ll-elements: Save file's enhancement data version is higher than this mod's supported version! Loading this save may cause issues!");
+            }
+            try {
+                /** @type {{[ident: string]: number}} */
+                var oldCellTypes = dataToAdd.cellTypes;
+                /** @type {{[ident: string]: number}} */
+                var oldElmTypes = dataToAdd.elementTypes;
+                /** @type {{[ident: string]: number}} */
+    
+                if (!oldCellTypes || !oldElmTypes) {
+                    console.error("ll-elements: Save file's enhancement data does not contain cellTypes or elementTypes. Skipping save-data-id-patching.");
+                    return;
+                }
+                /** @type {{newId?: number, ident: string}[]} */
+                var cellRemappingTable = []; // old to new
+                /** @type {{newId?: number, ident: string}[]} */
+                var elementRemappingTable = []; // old to new
+                var cellHasMissingId = false;
+                var elementHasMissingId = false;
+                var cellAllMatch = true;
+                var elementAllMatch = true;
+                {
+                    for (var [ident, id] of Object.entries(oldCellTypes)) {
+                        var newId = globalThis.Hook_CellType[ident];
+                        cellAllMatch = cellAllMatch && (newId === id);
+                        if (newId === undefined) {
+                            console.warn(`ll-elements: Previously existed CellType ${ident} not found.`);
+                            cellHasMissingId = true;
+                        }
+                        cellRemappingTable[id] = {newId: newId, ident: ident};
+                    }
+                    for (var [ident, id] of Object.entries(oldElmTypes)) {
+                        var newId = globalThis.Hook_ElementType[ident];
+                        elementAllMatch = elementAllMatch && (newId === id);
+                        if (newId === undefined) {
+                            console.warn(`ll-elements: Previously existed ElementType ${ident} not found.`);
+                            elementHasMissingId = true;
+                        }
+                        elementRemappingTable[id] = {newId: newId, ident: ident};
+                    }
+                }
+                if (cellAllMatch && elementAllMatch) {
+                    console.info("ll-elements: All cell and element types match the remapping table. No save-data-id-patching needed.");
+                    return cell;
+                }
+                if (cellHasMissingId) {
+                    console.warn("ll-elements: Some cell types are missing. Will attempt to replace them with 'Empty'.");
+                }
+                if (elementHasMissingId) {
+                    console.warn("ll-elements: Some element types are missing. Will attempt to replace them with 'Fire'.");
+                }
+                console.info("ll-elements: Running save-data-id-patching...");
+                var backupCellType = globalThis.Hook_CellType["Empty"];
+                var backupElementType = globalThis.Hook_ElementType["Fire"]; // should go 'poof' and disappear
+                
+                var remappingPaths = dataToAdd.indexRemappingPaths;
+                if (!remappingPaths) {
+                    console.error("ll-elements: Save file's enhancement data does not contain indexRemappingPaths. Unable to run save-data-id-patching.");
+                    return cell;
+                }
+                Object.entries(cellRemappingTable).forEach(([id, e]) => {if (e.newId === +id) delete cellRemappingTable[+id]});
+                Object.entries(elementRemappingTable).forEach(([id, e]) => {if (e.newId === +id) delete elementRemappingTable[+id]});
+    
+                var elmRemappingPaths = remappingPaths["element"] ?? [];
+    
+                cache.fixedElmConut = 0;
+                cache.fixedCellCount = 0;
+    
+                /** @type {(obj: object, prop: string) => void} */
+                const fixElmIdx = (obj, prop) =>{
+                    var val = obj[prop];
+                    if (isNaN(val)) return;
+                    var remap = elementRemappingTable[val];
+                    if (!remap) return;
+                    val = remap.newId ?? backupElementType;
+                    obj[prop] = val;
+                    cache.fixedElmConut++;
+                }
+    
+                /** @type {(obj: object, prop: string) => void} */
+                const fixCellIdx = (obj, prop) => {
+                    var val = obj[prop];
+                    if (isNaN(val)) return;
+                    var remap = cellRemappingTable[val];
+                    if (!remap) return;
+                    val = remap.newId ?? backupCellType;
+                    obj[prop] = val;
+                    cache.fixedCellCount++;
+                }
+    
+                /** @type {(obj: object, prop: string, metaType: string[]) => void} */
+                const fixByMetaType = (obj, prop, metaType) => {
+                    if (obj[prop] === undefined) return;
+                    switch (metaType[0]) {
+                        case "elementIndex":
+                            fixElmIdx(obj, prop);
+                            break;
+                        case "element":
+                            if (typeof obj[prop] == "object") remapElm(obj[prop]);
+                            break
+                        case "cellIndex":
+                            fixCellIdx(obj, prop);
+                            break;
+                        case "cell":
+                            remapCell(obj, prop);
+                        case "array":
+                            if (Array.isArray(obj[prop])) {
+                                var nextMetaType = metaType.slice(1);
+                                if (nextMetaType[0] === undefined) {
+                                    console.warn("ll-elements: Invalid metaType:", metaType);
+                                    return;
+                                }
+                                for (var i = 0; i < obj[prop].length; i++) {
+                                    fixByMetaType(obj[prop], i, nextMetaType);
+                                }
+                            }
+                            break;
+                        default:
+                            console.warn("ll-elements: Unknown metaType:", metaType[0]);
+                            break;
+                    }
+                }
+    
+                /** @type {(elm: Element) => void} */
+                const remapElm = (elm) => {
+                    fixElmIdx(elm, "type");
+                    for (var remapInfo of elmRemappingPaths) {
+                        /** @type {string} */
+                        var type = remapInfo.type;
+                        if (!type) continue;
+                        var typeIdent = globalThis.Hook_ElementType[type];
+                        if (typeIdent !== elm.type) continue;
+                        /** @type {string[]} */
+                        var paths = remapInfo.paths;
+                        if (!paths || !paths.length || paths.length < 1) continue;
+                        var metaType = remapInfo.metaType;
+                        if (!metaType || !metaType.length || metaType.length < 1) continue;
+                        var pathsBeforeLast = paths.slice(0, -1);
+                        var lastPath = paths[paths.length - 1];
+                        var targetObj = elm;
+                        for (var path of pathsBeforeLast) {
+                            targetObj = targetObj[path];
+                            if (!targetObj) break;
+                        }
+                        if (!targetObj) continue;
+                        fixByMetaType(targetObj, lastPath, metaType);
+                    }
+                }
+    
+                const remapCell = (obj, prop) => {
+                    var val = obj[prop];
+                    if (val === undefined) return;
+                    if (Number.isInteger(val)) {
+                        fixCellIdx(obj, prop);
+                    }
+                    else {
+                        fixCellIdx(val, "cellType"); // used when cell have hp
+                    }
+                }
+
+                cache.fixer = function (cell) {
+                    var container = [cell];
+                    if (Array.isArray(cell) && cell.length == 2) {
+                        // this is a cell with hp
+                        fixCellIdx(container, 0);
+                        return container[0];
+                    }
+                    if (typeof cell == "object") {
+                        // a full element object. At the moment of writing, only particle elements are under this
+                        remapElm(cell);
+                        return cell;
+                    }
+                    else if (typeof cell == "number") {
+                        if (cell >= 100) {
+                            // So this mean its an element id. Hm.
+                            container = [cell - 100];
+                            fixElmIdx(container, 0);
+                            return container[0] + 100;
+                        }
+                        else {
+                            // this is a cell id.
+                            fixCellIdx(container, 0);
+                            return container[0];
+                        }
+                    }
+                    else {
+                        debugger;
+                        console.warn("ll-elements: Unknown cell storage data:", cell);
+                    }
+                }
+            }
+            catch (e) {
+                console.error("ll-elements: Failed to apply id patching!", e);
+                return cell;
+            }
+            cache.enabled = true;
+        }
+        if (!cache.enabled) return cell;
+        return cache.fixer(cell);
+    }
+
+    globalThis.hookOnLoadSaveStartApplyEnhancement = (glb) => {
+        var store = glb.store;
+        debugger;
+        if (!store.Mod_SaveDataEnhancement) {
+            console.info("ll-elements: Save file's enhancement data does not exist. Skipping save-data-id-patching.");
+            return;
+        }
+        var dataToAdd = store.Mod_SaveDataEnhancement;
+        if (dataToAdd.enhancementVersion > 0) {
+            console.warn("ll-elements: Save file's enhancement data version is higher than this mod's supported version! Loading this save may cause issues!");
+        }
+        try {
+            /** @type {{[ident: string]: number}} */
+            var oldCellTypes = dataToAdd.cellTypes;
+            /** @type {{[ident: string]: number}} */
+            var oldElmTypes = dataToAdd.elementTypes;
+            /** @type {{[ident: string]: number}} */
+
+
+            if (!oldCellTypes || !oldElmTypes) {
+                console.error("ll-elements: Save file's enhancement data does not contain cellTypes or elementTypes. Skipping save-data-id-patching.");
+                return;
+            }
+            /** @type {{newId?: number, ident: string}[]} */
+            var cellRemappingTable = []; // old to new
+            /** @type {{newId?: number, ident: string}[]} */
+            var elementRemappingTable = []; // old to new
+            var cellHasMissingId = false;
+            var elementHasMissingId = false;
+            var cellAllMatch = true;
+            var elementAllMatch = true;
+            {
+                for (var [ident, id] of Object.entries(oldCellTypes)) {
+                    var newId = globalThis.Hook_CellType[ident];
+                    cellAllMatch = cellAllMatch && (newId === id);
+                    if (newId === undefined) {
+                        console.warn(`ll-elements: Previously existed CellType ${ident} not found.`);
+                        cellHasMissingId = true;
+                    }
+                    cellRemappingTable[id] = {newId: newId, ident: ident};
+                }
+                for (var [ident, id] of Object.entries(oldElmTypes)) {
+                    var newId = globalThis.Hook_ElementType[ident];
+                    elementAllMatch = elementAllMatch && (newId === id);
+                    if (newId === undefined) {
+                        console.warn(`ll-elements: Previously existed ElementType ${ident} not found.`);
+                        elementHasMissingId = true;
+                    }
+                    elementRemappingTable[id] = {newId: newId, ident: ident};
+                }
+            }
+            debugger;
+            if (cellAllMatch && elementAllMatch) {
+                console.info("ll-elements: All cell and element types match the remapping table. No save-data-id-patching needed.");
+                return;
+            }
+            if (cellHasMissingId) {
+                console.warn("ll-elements: Some cell types are missing. Will attempt to replace them with 'Empty'.");
+            }
+            if (elementHasMissingId) {
+                console.warn("ll-elements: Some element types are missing. Will attempt to replace them with 'Fire'.");
+            }
+            console.info("ll-elements: Running save-data-id-patching...");
+            var backupCellType = globalThis.Hook_CellType["Empty"];
+            var backupElementType = globalThis.Hook_ElementType["Fire"]; // should go 'poof' and disappear
+            
+            var remappingPaths = dataToAdd.indexRemappingPaths;
+            if (!remappingPaths) {
+                console.error("ll-elements: Save file's enhancement data does not contain indexRemappingPaths. Unable to run save-data-id-patching.");
+                return;
+            }
+            Object.entries(cellRemappingTable).forEach(([id, e]) => {if (e.newId === +id) delete cellRemappingTable[+id]});
+            Object.entries(elementRemappingTable).forEach(([id, e]) => {if (e.newId === +id) delete elementRemappingTable[+id]});
+
+            var elmRemappingPaths = remappingPaths["element"] ?? [];
+
+            var fixedElmConut = 0;
+            var fixedCellCount = 0;
+
+            /** @type {(obj: object, prop: string) => void} */
+            const fixElmIdx = (obj, prop) =>{
+                var val = obj[prop];
+                if (isNaN(val)) return;
+                var remap = elementRemappingTable[val];
+                if (!remap) return;
+                val = remap.newId ?? backupElementType;
+                obj[prop] = val;
+                fixedElmConut++;
+            }
+
+            /** @type {(obj: object, prop: string) => void} */
+            const fixCellIdx = (obj, prop) => {
+                var val = obj[prop];
+                if (isNaN(val)) return;
+                var remap = cellRemappingTable[val];
+                if (!remap) return;
+                val = remap.newId ?? backupCellType;
+                obj[prop] = val;
+                fixedCellCount++;
+            }
+
+            /** @type {(obj: object, prop: string, metaType: string[]) => void} */
+            const fixByMetaType = (obj, prop, metaType) => {
+                if (obj[prop] === undefined) return;
+                switch (metaType[0]) {
+                    case "elementIndex":
+                        fixElmIdx(obj, prop);
+                        break;
+                    case "element":
+                        if (typeof obj[prop] == "object") remapElm(obj[prop]);
+                        break
+                    case "cellIndex":
+                        fixCellIdx(obj, prop);
+                        break;
+                    case "cell":
+                        remapCell(obj, prop);
+                    case "array":
+                        if (Array.isArray(obj[prop])) {
+                            var nextMetaType = metaType.slice(1);
+                            if (nextMetaType[0] === undefined) {
+                                console.warn("ll-elements: Invalid metaType:", metaType);
+                                return;
+                            }
+                            for (var i = 0; i < obj[prop].length; i++) {
+                                fixByMetaType(obj[prop], i, nextMetaType);
+                            }
+                        }
+                        break;
+                    default:
+                        console.warn("ll-elements: Unknown metaType:", metaType[0]);
+                        break;
+                }
+            }
+
+            /** @type {(elm: Element) => void} */
+            const remapElm = (elm) => {
+                fixElmIdx(elm, "type");
+                for (var remapInfo of elmRemappingPaths) {
+                    /** @type {string} */
+                    var type = remapInfo.type;
+                    if (!type) continue;
+                    var typeIdent = globalThis.Hook_ElementType[type];
+                    if (typeIdent !== elm.type) continue;
+                    /** @type {string[]} */
+                    var paths = remapInfo.paths;
+                    if (!paths || !paths.length || paths.length < 1) continue;
+                    var metaType = remapInfo.metaType;
+                    if (!metaType || !metaType.length || metaType.length < 1) continue;
+                    var pathsBeforeLast = paths.slice(0, -1);
+                    var lastPath = paths[paths.length - 1];
+                    var targetObj = elm;
+                    for (var path of pathsBeforeLast) {
+                        targetObj = targetObj[path];
+                        if (!targetObj) break;
+                    }
+                    if (!targetObj) continue;
+                    fixByMetaType(targetObj, lastPath, metaType);
+                }
+            }
+
+            const remapCell = (obj, prop) => {
+                var val = obj[prop];
+                if (val === undefined) return;
+                if (Number.isInteger(val)) {
+                    fixCellIdx(obj, prop);
+                }
+                else {
+                    fixCellIdx(val, "cellType"); // used when cell have hp
+                }
+            }
+
+
+            var matrix = store.world.matrix;
+            for (var py=0; py<matrix.length; py++) {
+                for (var px=0; px<matrix[py].length; px++) {
+                    var baseObj = matrix[py];
+                    var cell = baseObj[px];
+                    if (!!(cell?.type)) {
+                        remapElm(cell);
+                    }
+                    else {
+                        remapCell(baseObj, px);
+                    }
+                }
+            }
+
+            console.info("ll-elements: Finished save-data-id-patching.");
+            console.info("ll-elements: Remapped element id count:", fixedElmConut);
+            console.info("ll-elements: Remapped cell id count:", fixedCellCount);
+            debugger;
+        }
+        catch (e) {
+            console.error("ll-elements: Failed to apply id patching!", e);
+            return;
+        }
+    }
+
+    globalThis.hookOnLoadSaveEndInjectEnhancement = (glb) => {
+        var store = glb.store;
+        if (store.Mod_SaveDataEnhancement_LoadingCache) {
+            // Just got though a load.
+            var cache = store.Mod_SaveDataEnhancement_LoadingCache;
+            if (cache.enabled) {
+                console.info("ll-elements: Finished save-data-id-patching.");
+                console.info("ll-elements: Remapped element id count:", cache.fixedElmConut);
+                console.info("ll-elements: Remapped cell id count:", cache.fixedCellCount);
+            }
+            delete store.Mod_SaveDataEnhancement_LoadingCache;
+        }
+        const selfVersion = 0; // todo change on release
+        if (store.dataToAdd?.enhancementVersion > selfVersion) {
+            console.warn("ll-elements: Save file's enhancement data version is higher than this mod's supported version! Loading this save may cause issues!");
+        }
+        var remappingPaths = {};
+        remappingPaths["element"] = [
+            {
+                type: "Flame",
+                paths: ["data","output","elementType"],
+                metaType: ["elementIndex"],
+            }, {
+                type: "Flame",
+                paths: ["data","output"],
+                metatype: ["array", "elementIndex"],
+            }, {
+                type: "Particle",
+                paths: ["element"],
+                metatype: ["element"]
+            }
+        ]
+        var elmTypes = Object.entries(globalThis.Hook_ElementType)
+            .filter(e => isNaN(e[0]) && !Number.isNaN(e[1]))
+            .reduce((rv, x) => ((rv[x[0]] = x[1]), rv), {});
+        var cellTypes = Object.entries(globalThis.Hook_CellType)
+            .filter(e => isNaN(e[0]) && !Number.isNaN(e[1]))
+            .reduce((rv, x) => ((rv[x[0]] = x[1]), rv), {});
+
+        var dataToAdd = {
+            enhancementVersion: 0, // todo change on release
+            elementTypes: elmTypes,
+            cellTypes: cellTypes,
+            indexRemappingPaths: remappingPaths,
+        };
+        store.Mod_SaveDataEnhancement = dataToAdd;
     }
 }
 
