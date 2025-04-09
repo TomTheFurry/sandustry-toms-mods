@@ -229,7 +229,6 @@ class CellTypeDefinition {
             [hue, cmp(sat+2), cmp(val+1)],
             [hue, cmp(sat+8), cmp(val+4)]
         ];
-        console.log(result);
         return result;
     }
 }
@@ -321,7 +320,6 @@ class LibElementsApi /** @implements {LibApi} */ {
             var bindingMake = (bindName) => {
                 var params = {};
                 {// Main:
-                    console.log("name:", bindName, nameTable[bindName]);
                     var name = nameTable[bindName][0];
                     if (name) {
                         ll.AddPatternPatches({main: [name]},
@@ -384,7 +382,7 @@ class LibElementsApi /** @implements {LibApi} */ {
             throw new Error("Particles are not yet supported!");
         }
         //console.log("ll-elements: Soil Cell Types:", soilCellTypes);
-        console.log("ll-elements: Element Cell Types:", elementCellTypes);
+        //console.log("ll-elements: Element Cell Types:", elementCellTypes);
         // for soils, they are directly in cell type id list. use cell type id
         for (var i = 0; i < soilCellTypes.length; i++) {
             var ct = soilCellTypes[i];
@@ -980,6 +978,17 @@ globalThis.llElementsPreHook = function () {
     /** @type {PhysicBinding} */
     globalThis.physicsBindingApi = {};
 
+    // Conditional, as this func is added in libloader v0.1.1
+    globalThis.llLogVerbose ??= (...args) => {
+        var inWorker = (globalThis.scriptId);
+        if (inWorker) {
+            console.debug(...args);
+        }
+        else {
+            console.log(...args);
+        }
+    }
+
     globalThis.lazyPropSet = (obj, propName, func) => {
         Object.defineProperty(obj, propName, {
             get: function () {
@@ -1016,7 +1025,7 @@ globalThis.llElementsPreHook = function () {
 
     var genericFixRecipe = (recipeType, additionalFixer) => {
         return () => {
-            console.log(`ll-elements: Evaluating ${recipeType}Recipes...`);
+            globalThis.llLogVerbose(`ll-elements: Evaluating ${recipeType}Recipes...`);
             var source = globalThis[`${recipeType}RecipesSource`];
             if (!source) throw new Error(`ll-elements: ${recipeType}RecipesSource not found!`);
             var ids = globalThis.Hook_ElementType;
@@ -1037,14 +1046,14 @@ globalThis.llElementsPreHook = function () {
                 additionalFixer?.(recipe);
                 computed[keyId] = recipe;
             }
-            console.log(`ll-elements: ${recipeType}Recipes computed:`, computed);
+            globalThis.llLogVerbose(`ll-elements: ${recipeType}Recipes computed:`, computed);
             return computed;
         }
     }
 
     var genericFixCallbacks = (callbacksType, additionalFixer) => {
         return () => {
-            console.log(`ll-elements: Evaluating ${callbacksType}...`);
+            globalThis.llLogVerbose(`ll-elements: Evaluating ${callbacksType}...`);
             var source = globalThis[`${callbacksType}Source`];
             if (!source) throw new Error(`ll-elements: ${callbacksType}Source not found!`);
             var ids = globalThis.Hook_ElementType;
@@ -1058,7 +1067,7 @@ globalThis.llElementsPreHook = function () {
                 additionalFixer?.(callback);
                 computed[keyId] = callback;
             }
-            console.log(`ll-elements: ${callbacksType} computed:`, computed);
+            globalThis.llLogVerbose(`ll-elements: ${callbacksType} computed:`, computed);
             return computed;
         }
     }
@@ -1212,7 +1221,7 @@ globalThis.llElementsPreHook = function () {
             }
             else {
                 result = elmDataOutput;
-                console.log("ll-elements: Flame end result:", result);
+                globalThis.llLogVerbose("ll-elements: Flame end result:", result);
             }
             if (result.length > 1) {
                 var findAllSpot = binding.trySpawnElementsAroundPos(global, x, y,
@@ -1258,7 +1267,7 @@ globalThis.llElementsPreHook = function () {
         else result = recipe.result;
         /** @type {number[]|false|null} */
         var genResults = globalThis.runtimeRecipeResultGenerate(result);
-        console.log("ll-elements: Spark flame result:", genResults);
+        globalThis.llLogVerbose("ll-elements: Spark flame result:", genResults);
         if (typeof genResults === "boolean") return genResults; // if returned a bool, don't run normal handling
         genResults ??= []; // empty array if null
         var newFlame = binding.newElementInstance(globalThis.Hook_ElementType.Flame, cell.x, cell.y);
@@ -1287,7 +1296,7 @@ globalThis.llElementsPreHook = function () {
         /** @type {number[]} */
         var genResults = globalThis.runtimeRecipeResultGenerate(result);
         if (typeof genResults === "boolean") return genResults; // if returned a bool, don't run normal handling
-        console.log("ll-elements: Kinetic press result:", genResults);
+        globalThis.llLogVerbose("ll-elements: Kinetic press result:", genResults);
         genResults ??= []; // empty array if null
         if (genResults.length == 0) return true; // done
         var snapGridFloor = v => Math.floor(v / elm.snapGridCellSize) * elm.snapGridCellSize;
@@ -1304,7 +1313,7 @@ globalThis.llElementsPreHook = function () {
         /** @type {{[a: CellTypeIdent]: {[b: CellTypeIdent]: CellTypeIdent}}}*/
         var newEntries = globalThis.BasicInteractionRecipesSource;
         if (!newEntries) throw new Error("ll-elements: Basic interaction recipes source not found!");
-        console.log("ll-elements: Basic interaction recipes source:", newEntries);
+        globalThis.llLogVerbose("ll-elements: Basic interaction recipes source:", newEntries);
         for (var [key, entries] of Object.entries(newEntries)) {
             var keyId = globalThis.Hook_ElementType[key];
             if (keyId === undefined) throw new Error(`ll-elements: Element type ${key} not found!`);
@@ -1317,7 +1326,7 @@ globalThis.llElementsPreHook = function () {
                 list.push([fromId, toId]);
             }
         }
-        console.log("ll-elements: Basic interaction recipes updated:", table);
+        globalThis.llLogVerbose("ll-elements: Basic interaction recipes updated:", table);
     };
 
     globalThis.lazyPropSet(globalThis, "ComplexInteractionRecipes", genericFixRecipe("ComplexInteraction", (v) => {
@@ -1347,7 +1356,7 @@ globalThis.llElementsPreHook = function () {
         /** @type {number[]} */
         var genResults = globalThis.runtimeRecipeResultGenerate(result);
         if (typeof genResults === "boolean") return genResults; // if returned a bool, don't run normal handling
-        console.log("ll-elements: Complex interaction result:", genResults);
+        globalThis.llLogVerbose("ll-elements: Complex interaction result:", genResults);
         genResults ??= []; // empty array if null
         if (genResults.length == 0) return true; // done
         var x = elm.x;
@@ -1376,28 +1385,28 @@ globalThis.llElementsPreHook = function () {
     globalThis.patchCellTypeIds = (list, newIds) => {
         globalThis.Hook_CellType ??= list;
         var modded = globalThis.ModdedCellTypes = [];
-        console.log("patching cell type ids, adding newIds:", newIds);
+        globalThis.llLogVerbose("patching cell type ids, adding newIds:", newIds);
         for (var i = 0; i < newIds.length; i++) {
             modded[newIds[i][0]] = list[newIds[i][0]] = newIds[i][1];
             modded[newIds[i][1]] = list[newIds[i][1]] = newIds[i][0];
         }
-        console.log("patched cell type ids, result:", list);
+        globalThis.llLogVerbose("patched cell type ids, result:", list);
     }
 
     globalThis.patchElementTypeIds = (list, newIds) => {
         globalThis.Hook_ElementType ??= list;
         var modded = globalThis.ModdedElementTypes = [];
-        console.log("patching element type ids, adding newIds:", newIds);
+        globalThis.llLogVerbose("patching element type ids, adding newIds:", newIds);
         for (var i = 0; i < newIds.length; i++) {
             modded[newIds[i][0]] = list[newIds[i][0]] = newIds[i][1];
             modded[newIds[i][1]] = list[newIds[i][1]] = newIds[i][0];
         }
-        console.log("patched element type ids, result:", list);
+        globalThis.llLogVerbose("patched element type ids, result:", list);
     }
 
     globalThis.patchElementTypeConfig = (list, newConfig) => {
         globalThis.Hook_ElementTypeConfig ??= list;
-        console.log("patching element type config, adding newConfig:", newConfig);
+        globalThis.llLogVerbose("patching element type config, adding newConfig:", newConfig);
         var elmTypeIds = globalThis.Hook_ElementType;
         var matterTypeIds = globalThis.Hook_MatterType;
         if (!elmTypeIds) throw new Error("ll-Elements: ElementTypeIds Not Loaded! How!");
@@ -1423,11 +1432,11 @@ globalThis.llElementsPreHook = function () {
             }
             list[rawCfg.idx] = cfg;
         }
-        console.log("patched element type config, result:", list);
+        globalThis.llLogVerbose("patched element type config, result:", list);
     }
     globalThis.patchSoilTypeConfig = (list, newConfig) => {
         globalThis.Hook_SoilTypeConfig ??= list;
-        console.log("patching soil type config, adding newConfig:", newConfig);
+        globalThis.llLogVerbose("patching soil type config, adding newConfig:", newConfig);
         var cellTypeIds = globalThis.Hook_CellType;
         var elmTypeIds = globalThis.Hook_ElementType;
         if (!cellTypeIds) throw new Error("ll-Elements: CellTypeIds Not Loaded! How!");
@@ -1462,8 +1471,8 @@ globalThis.llElementsPreHook = function () {
                 fog: rawCfg.isFog,
             };
             list[rawCfg.idx] = cfg;
-            console.log("patched soil type config, result:", list);
         }
+        globalThis.llLogVerbose("patched soil type config, result:", list);
     }
 
     globalThis.patchResolveColorConflicts = (originalColorScheme, hslFunc, soilDarkeningLevels) => {
@@ -1551,7 +1560,7 @@ globalThis.llElementsPreHook = function () {
                 var rgba = elmColors[i];
                 var isValid = isValidRgba(rgba);
                 if (!isValid) {
-                    console.log(`ll-elements: Element ${ident} varient #${i} color is not valid!`, rgba);
+                    globalThis.llLogVerbose(`ll-elements: Element ${ident} varient #${i} color is not valid!`, rgba);
                     continue;
                 }
                 var color = colorToStr(rgba);
@@ -1575,7 +1584,7 @@ globalThis.llElementsPreHook = function () {
                     }
                 }
                 if (values.some(isNaN)) {
-                    console.log(`ll-elements: Soil ${ident} varient #${i} color is not valid!`, values);
+                    globalThis.llLogVerbose(`ll-elements: Soil ${ident} varient #${i} color is not valid!`, values);
                     continue;
                 }
                 if (values.length == 3) {
@@ -1592,7 +1601,7 @@ globalThis.llElementsPreHook = function () {
                     entries.push({isElm: false, id: id, ident: ident, colorVarientId: i});
                 }
                 else {
-                    console.log(`ll-elements: Soil ${ident} varient #${i} color is not valid!`, values);
+                    globalThis.llLogVerbose(`ll-elements: Soil ${ident} varient #${i} color is not valid!`, values);
                     continue;
                 }
             }
@@ -1639,7 +1648,7 @@ globalThis.llElementsPreHook = function () {
             var uniqueMappingCount = Object.keys(entriesBySoilType).length + Object.keys(entriesByElmType).length;
             if (uniqueMappingCount == 1) continue; // no conflict here, just a single mapping
             // conflict here, so we need to resolve it
-            console.log("ll-elements: Color conflict detected for color:", color, "Following entries mapped to it:");
+            globalThis.llLogVerbose("ll-elements: Color conflict detected for color:", color, "Following entries mapped to it:");
             colorUniqueConflictCount++;
             // print the entries
             var entriesSoilType = Object.entries(entriesBySoilType).sort((a, b) => +a[0] - +b[0]);
@@ -1651,11 +1660,11 @@ globalThis.llElementsPreHook = function () {
                     var entry = entries[i];
                     if (entry.isElm) {
                         var elmEntry = entry;
-                        console.log(`Element#${elmEntry.id} (${elmEntry.ident}), color varient #${elmEntry.colorVarientId}`);
+                        globalThis.llLogVerbose(`Element#${elmEntry.id} (${elmEntry.ident}), color varient #${elmEntry.colorVarientId}`);
                     }
                     else {
                         var soilEntry = entry;
-                        console.log(`Soil#${soilEntry.id} (${soilEntry.ident}), color varient #${soilEntry.colorVarientId} ${ soilEntry.soilDarkening ? `, darkening #${soilEntry.soilDarkening}` : ""}`);
+                        globalThis.llLogVerbose(`Soil#${soilEntry.id} (${soilEntry.ident}), color varient #${soilEntry.colorVarientId} ${ soilEntry.soilDarkening ? `, darkening #${soilEntry.soilDarkening}` : ""}`);
                     }
                 }
                 colorTotalConflictCount++;
@@ -1768,7 +1777,7 @@ globalThis.llElementsPreHook = function () {
                 });
                 if (!newHsl) throw new Error(`ll-elements: Color conflict resolution failed! No remaining unused color found!`);
 
-                console.log(`ll-elements: Color conflict resolution for soil ${soilTypes[keyId]} primary hsl:`, originalHsl, `->`, newHsl);
+                globalThis.llLogVerbose(`ll-elements: Color conflict resolution for soil ${soilTypes[keyId]} primary hsl:`, originalHsl, `->`, newHsl);
 
                 // actually update the color
                 for (var darken of darkenList) {
@@ -1795,7 +1804,7 @@ globalThis.llElementsPreHook = function () {
                 if (!result) {
                     throw new Error(`ll-elements: Color conflict resolution failed! No remaining unused color found!`);
                 }
-                console.log(`ll-elements: Color conflict resolution for soil ${soilTypes[soilId]} color:`, toShift, `->`, result);
+                globalThis.llLogVerbose(`ll-elements: Color conflict resolution for soil ${soilTypes[soilId]} color:`, toShift, `->`, result);
                 var newRgba = [result[0], result[1], result[2], 255];
                 for (var j = 0; j < soilEntries.length; j++) {
                     var elmEntry = soilEntries[j];
@@ -1824,7 +1833,7 @@ globalThis.llElementsPreHook = function () {
                 if (!result) {
                     throw new Error(`ll-elements: Color conflict resolution failed! No remaining unused color found!`);
                 }
-                console.log(`ll-elements: Color conflict resolution for element ${elmTypes[elmId]} color:`, toShift, `->`, result);
+                globalThis.llLogVerbose(`ll-elements: Color conflict resolution for element ${elmTypes[elmId]} color:`, toShift, `->`, result);
                 var newRgba = [result[0], result[1], result[2], 255];
                 for (var j = 0; j < elmEntries.length; j++) {
                     var elmEntry = elmEntries[j];
@@ -1849,7 +1858,7 @@ globalThis.llElementsPreHook = function () {
                 .reduce((rv, x)=>((rv[x.ident]??=[]).push(x),rv),{})])
             .map(p => [p[0], Object.entries(p[1])])
             .filter(p => p[1].length > 1);
-        console.log("ll-elements: Remaining conflicts:", remainingConflicts);
+        globalThis.llLogVerbose("ll-elements: Remaining conflicts:", remainingConflicts);
         var stats = {
             totalColorCount: totalColorCount,
             uniqueColorCount: uniqueColorCount,
@@ -1858,7 +1867,7 @@ globalThis.llElementsPreHook = function () {
             changedEntriesCount: changedEntriesCount,
             newUniqueColorCount: Object.keys(mappings).length,
         }
-        console.log("ll-elements: Color conflict resolution stats:", stats);
+        globalThis.llLogVerbose("ll-elements: Color conflict resolution stats:", stats);
         //debugger;
         
         return stats;
