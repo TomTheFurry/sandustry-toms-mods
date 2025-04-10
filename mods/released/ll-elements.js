@@ -1,7 +1,7 @@
 
 exports.modinfo = {
     name: "ll-elements",
-    version: "0.2.0",
+    version: "0.2.1",
     dependencies: [],
     modauthor: "TomTheFurry",
 };
@@ -24,7 +24,9 @@ exports.modinfo = {
 // - Bug fixes:
 //   - Fixed physics-crash on vanilla burnable soils getting burned
 //   - Fixed physics-crash on vanilla fog discovery
-
+// v.2.1 updates:
+// - Made fogs uncoverable by default, but can be changed to vanilla behavior
+// - Fixed incorrect handling of the various callback results in phyiscs crafting
 
 // ==== Headers / Class Defs ====
 // #region Headers / Class Defs
@@ -181,6 +183,7 @@ class CellTypeDefinition {
     soilDamagableFunction = undefined; // todo
 
     soilIsFog = false;
+    soilFogPreventTriggerUncover = false;
     soilBackgroundElementType = undefined;
     soilFogUncoverFunc = undefined;
 
@@ -398,6 +401,7 @@ class LibElementsApi /** @implements {LibApi} */ {
         {
             var newCellTypeIds = [];
             var newElementTypeIds = [];
+
             for (var i = 0; i < soilCellTypes.length; i++) {
                 newCellTypeIds.push([soilCellTypes[i].id, soilCellTypes[i].runtimeIdx]);
             }
@@ -653,7 +657,9 @@ class LibElementsApi /** @implements {LibApi} */ {
                     }
 
                     soilIds.push(ct.id);
-                    if (ct.soilIsFog) soilFogIds.push(ct.id); else soilSolidIds.push(ct.id);
+                    if (ct.soilIsFog) soilFogIds.push(ct.id);
+                    // fog unfogs only if is solid... So.
+                    if (!ct.soilIsFog || !ct.soilFogPreventTriggerUncover) soilSolidIds.push(ct.id);
                     if (ct.soilIsFog && ct.soilFogUncoverFunc) {
                         throw new Error(`ll-elements: Soil ${ct.id} fog uncover function is not supported!`);
                     }
@@ -1258,6 +1264,8 @@ globalThis.llElementsPreHook = function () {
         var elm = cell;
         var recipe = burnRecipes[elm.type];
         if (!recipe) return false; // no mapped recipe for this element
+
+        /** @type {RuntimeRecipeResult|boolean|null} */
         var result;
         if (recipe.result instanceof Function) {
             // if it's a function, call it to get the recipe
@@ -1265,11 +1273,12 @@ globalThis.llElementsPreHook = function () {
             result = recipe.result({api:binding, global:global, cell:elm, otherCell: hotElm});
         }
         else result = recipe.result;
-        /** @type {number[]|false|null} */
+        result ??= []; // empty array if null
+        globalThis.llLogVerbose("ll-elements: Spark flame result:", result);
+        if (typeof result === "boolean") return result; // if returned a bool, don't run normal handling
+        
+        /** @type {number[]} */
         var genResults = globalThis.runtimeRecipeResultGenerate(result);
-        globalThis.llLogVerbose("ll-elements: Spark flame result:", genResults);
-        if (typeof genResults === "boolean") return genResults; // if returned a bool, don't run normal handling
-        genResults ??= []; // empty array if null
         var newFlame = binding.newElementInstance(globalThis.Hook_ElementType.Flame, cell.x, cell.y);
         newFlame.data = {output: genResults};
         binding.setCell(global, cell.x, cell.y, newFlame);
@@ -1278,7 +1287,7 @@ globalThis.llElementsPreHook = function () {
 
     globalThis.lazyPropSet(globalThis, "KineticRecipes", genericFixRecipe("Kinetic"));
 
-    /** @type {(global, cell: )=>void} */
+    /** @type {(global, cell: Element)=>void} */
     globalThis.hookOnKineticPress = (global, elm) => {
         if (elm.velocity.y < 200) return false;
         /** @type {PhysicBinding} */
@@ -1286,6 +1295,8 @@ globalThis.llElementsPreHook = function () {
         var kineticRecipes = globalThis.KineticRecipes;
         var recipe = kineticRecipes[elm.type];
         if (!recipe) return false; // no mapped recipe for this element
+
+        /** @type {RuntimeRecipeResult|boolean|null} */
         var result;
         if (recipe.result instanceof Function) {
             // if it's a function, call it to get the recipe
@@ -1293,11 +1304,12 @@ globalThis.llElementsPreHook = function () {
             result = recipe.result({api:binding, global:global, cell:elm});
         }
         else result = recipe.result;
+        result ??= []; // empty array if null
+        globalThis.llLogVerbose("ll-elements: Kinetic press result:", result);
+        if (typeof result === "boolean") return result; // if returned a bool, don't run normal handling
+        
         /** @type {number[]} */
         var genResults = globalThis.runtimeRecipeResultGenerate(result);
-        if (typeof genResults === "boolean") return genResults; // if returned a bool, don't run normal handling
-        globalThis.llLogVerbose("ll-elements: Kinetic press result:", genResults);
-        genResults ??= []; // empty array if null
         if (genResults.length == 0) return true; // done
         var snapGridFloor = v => Math.floor(v / elm.snapGridCellSize) * elm.snapGridCellSize;
         var snapGridCeil = v => Math.ceil(v / elm.snapGridCellSize) * elm.snapGridCellSize;
@@ -1346,18 +1358,21 @@ globalThis.llElementsPreHook = function () {
         var recipe = recipes[elm.type];
         if (!recipe) return false; // no mapped recipe for this element
         if (recipe.constraint && recipe.constraint !== elmB.type) return false; // not the right element type
+        
+        /** @type {RuntimeRecipeResult|boolean|null} */
         var result;
         if (recipe.result instanceof Function) {
             // if it's a function, call it to get the recipe
-            /** @type {(ctx:InteractionCtx)=>RuntimeRecipeResult} */
+            /** @type {(ctx:PhysicCtx)=>RuntimeRecipeResult} */
             result = recipe.result({api:binding, global:global, cell:elm, otherCell: elmB});
         }
         else result = recipe.result;
+        result ??= []; // empty array if null
+        globalThis.llLogVerbose("ll-elements: Complex interaction result:", result);
+        if (typeof result === "boolean") return result; // if returned a bool, don't run normal handling
+        
         /** @type {number[]} */
         var genResults = globalThis.runtimeRecipeResultGenerate(result);
-        if (typeof genResults === "boolean") return genResults; // if returned a bool, don't run normal handling
-        globalThis.llLogVerbose("ll-elements: Complex interaction result:", genResults);
-        genResults ??= []; // empty array if null
         if (genResults.length == 0) return true; // done
         var x = elm.x;
         var y = elm.y;
