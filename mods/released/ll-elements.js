@@ -1,7 +1,7 @@
 
 exports.modinfo = {
     name: "ll-elements",
-    version: "0.2.1",
+    version: "0.2.2",
     dependencies: [],
     modauthor: "TomTheFurry",
 };
@@ -27,6 +27,8 @@ exports.modinfo = {
 // v.2.1 updates:
 // - Made fogs uncoverable by default, but can be changed to vanilla behavior
 // - Fixed incorrect handling of the various callback results in phyiscs crafting
+// v.2.2 hotfix:
+// - Add missing patch to handle vanilla bug with damagable soil colors
 
 // ==== Headers / Class Defs ====
 // #region Headers / Class Defs
@@ -717,6 +719,12 @@ class LibElementsApi /** @implements {LibApi} */ {
                     (cType,eType,fog,x,y,ne) => `return ${
                     Object.entries(soilFogToResultMapping).map(([fogId, elmType]) =>
                         `${fog}===${cType}.${fogId}?${ne}(${eType}.${elmType},${x},${y}):\n`).join("")}${fog}===${cType}.FogWater?${ne}(${eType}.Water,${x},${y})`
+                );
+                // patch the color for damaged soil to just check if cell has hp, instead of the type
+                ll.AddPatternPatches(
+                    { "main": ["t", "o"], "336": ["n.vZ", "s"], "546": ["a.vZ", "s"] },
+                    (cType, c) => `${cType}.Petal].includes(${c}.cellType)`,
+                    (cType, c) => `${cType}.Petal].includes(${c}.cellType) || ${c}.hp !== undefined`
                 );
             }
         }
