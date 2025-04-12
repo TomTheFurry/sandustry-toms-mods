@@ -1,6 +1,6 @@
 exports.modinfo = {
     name: "ll-toms-snow-melting",
-    version: "0.1.0",
+    version: "0.2.0",
     dependencies: [],
     modauthor: "TomTheFurry",
 };
@@ -18,7 +18,7 @@ exports.LibLoaderEvents = {
                 || api.getElementTypeAtPos(ctx.global, elm.x+1, elm.y) == globalThis.Hook_ElementType.Lava
                 || api.getElementTypeAtPos(ctx.global, elm.x-1, elm.y) == globalThis.Hook_ElementType.Lava) 
             {
-                return [globalThis.Hook_ElementType.Water];
+                return [-globalThis.Hook_ElementType.Water];
             }
             return false;
         }})

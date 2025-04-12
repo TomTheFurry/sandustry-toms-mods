@@ -1,11 +1,10 @@
 
 exports.modinfo = {
     name: "ll-elements-example",
-    version: "0.1.0",
+    version: "0.3.0",
     dependencies: [],
     modauthor: "TomTheFurry",
 };
-
 
 // ==== Headers / Class Defs ====
 // #region Headers / Class Defs
@@ -19,6 +18,8 @@ class PhysicBinding {
     setElementToPos; // doesn't check for what's there in the target pos
     /** @type {(global, elmA: Element, elmB: Element)=>void} */
     swapTwoElementPosition;
+    /** @type {(global, elm: Element, velocity: {x: number, y: number})=>Particle} */
+    launchElementAsParticle;
 
     /** @type {(cell: Cell)=>boolean} */
     cellIsSolidSoil; // note that fog soils are not solid, but they are soil types
@@ -51,6 +52,9 @@ class PhysicBinding {
     /** @type {(global, targetPosX: number, targetPosY: number)=>Cell} */
     getCellAtPos;
 
+    /** @type {(store, targetPosX: number, targetPosY: number)=>Cell} */
+    getCellAtPosFromStore;
+
     /** @type {(elementType: number, posX: number, posY: number, extraProperties?: object)=>Element} */
     newElementInstance;
 
@@ -59,13 +63,37 @@ class PhysicBinding {
      *  @type {(global, posX: number, posY: number, elementsToSpawn: ElementType[],
      *          area: [[minX:number, minY:number],[maxX:number, maxY:number]],
      *          opts?: {
-     *              condition?: (posX: number, posY: number)=>boolean,
-     *              spawner?: (posX: number, posY: number, elmType: number, idx: number)=>Element,
+     *              condition?: (posX: number, posY: number)=>boolean?,
+     *              spawner?: (posX: number, posY: number, elmType: number, idx: number)=>Element?,
      *               weakBatching?: boolean,
      *              allowNonTouching?: boolean,
      *          }) => boolean}
     */
     trySpawnElementsAroundPos;
+
+    /**
+     *  @type {(global, posX: number, posY: number, cellsToSpawn: number[],
+     *          area: [[minX:number, minY:number],[maxX:number, maxY:number]],
+     *          opts?: {
+     *              condition?: (posX: number, posY: number)=>boolean?,
+     *              spawner?: (posX: number, posY: number, cellType: number, idx: number)=>Cell?,
+     *               weakBatching?: boolean,
+     *              allowNonTouching?: boolean,
+     *          }) => boolean}
+    */
+    trySpawnCellsAroundPos;
+
+    /**
+     *  @type {(posX: number, posY: number, count: number,
+     *          area: [[minX:number, minY:number],[maxX:number, maxY:number]],
+     *          condition: (posX: number, posY: number)=>boolean?,
+     *          action: (posX: number, posY: number, idx: number)=>void,
+     *          opts?: {
+     *               weakBatching?: boolean,
+     *               allowNonTouching?: boolean,
+     *          }) => boolean}
+    */
+    tryAroundPos;
 }
 
 /**
@@ -76,11 +104,26 @@ class PhysicBinding {
  * @typedef {string} CellTypeIdent
  * @typedef {[number, number, number, number]} Rgba
  * @typedef {[number, number, number]} Hsl
- * @typedef {{type: number} | number} Cell
- * @typedef {{type: number, x: number, y: number}} Element
+ * @typedef {Element | DamagedSoil | number} Cell
+ * @typedef {{cellType: number, hp: number}} DamagedSoil
+ * @typedef {{
+ *  type: number,
+ *  x: number,
+ *  y: number,
+ *  velocity: {x: number, y: number},
+ *  minVelocity: {x: number, y: number},
+ *  data: object?,
+ *  density: number,
+ *  threshold: {x: number, y: number},
+ *  isFreeFalling: boolean,
+ *  duration: {max: number | -1, left: number},
+ * }} Element
+ * @typedef {{element: Element} & Element} Particle
  * @typedef {{x:number, y:number}} Vec2
- * @typedef {{api: PhysicBinding, global, cell: Element}} PhysicCtx
- * @typedef {PhysicCtx & {otherCell: Element}} InteractionCtx
+ * @typedef {{api: PhysicBinding, global}} GameCtx
+ * @typedef {GameCtx & {cell: Element}} ElementCtx
+ * @typedef {ElementCtx & {otherCell: Element}} InteractionCtx
+ * @typedef {GameCtx & {cell: Cell, x: number, y: number}} CellCtx
  * @typedef {CellTypeIdent | {type: CellTypeIdent, amount: (Number | [Number, Number])}} RecipeResultEntry
  * @typedef {(RecipeResultEntry | RecipeResultEntry[])} RecipeResult
  * @typedef {number | {type: number, amount: (Number | [Number, Number])}} RuntimeRecipeResultEntry
@@ -99,14 +142,10 @@ const CellMetaTypes = ["Soil", "Element", "Particle"]
  */
 const MatterTypes = ["Solid", "Liquid", "Particle", "Gas", "Static", "Slushy", "Wisp"]
 
-/**
- * @template {PhysicCtx} TCtx
- * @typedef {{key: CellTypeIdent, result: RecipeResult | (ctx:TCtx)=>RuntimeRecipeResult}} Recipe<TCtx>
- */
-/**
- * @template {PhysicCtx} TCtx
- * @typedef {{key: CellTypeIdent, result: RuntimeRecipeResult | (ctx:TCtx)=>RuntimeRecipeResult}} RuntimeRecipe<TCtx>
- */
+/** @template {GameCtx} TCtx @typedef {(ctx:TCtx)=>(RuntimeRecipeResult|boolean)} RuntimeRecipeCallback<TCtx> */
+/** @template {GameCtx} TCtx @typedef {(ctx:TCtx)=>boolean|void} Event<TCtx> */
+/** @template {GameCtx} TCtx @typedef {{key: CellTypeIdent, result: RecipeResult | (ctx:TCtx)=>(RuntimeRecipeResult|boolean)}} Recipe<TCtx> */
+/** @template {GameCtx} TCtx @typedef {{key: CellTypeIdent, result: RuntimeRecipeResult | (ctx:TCtx)=>RuntimeRecipeResult}} RuntimeRecipe<TCtx> */
 
 class CellTypeDefinition {
     /** @type {CellMetaType} */
@@ -115,7 +154,7 @@ class CellTypeDefinition {
     id; // type identifier
     /** @type {number} */
     runtimeIdx = -1; // runtime index, propulated by loaders. Either cell type id or element type id, depending on metaType    
-    /** @type {number | Hsl | Hsl[] | Rgba[] | (ctx:PhysicCtx)=>Rgba} */
+    /** @type {number | Hsl | Hsl[] | Rgba[] | (ctx:ElementCtx)=>Rgba} */
     //pixelColors = [[255, 0, 0, 255]]; // pixel colors, mapped by varients
     /** @type {string?} */
     displayName; // display name. If null, use id
@@ -133,6 +172,8 @@ class CellTypeDefinition {
     // hsl color, or the hue color, or, if soil output is defined, can be null
     /** @type {Hsl?} */
     soilColorHsl = undefined;
+    // Soil Output: This is for vanilla on dug handling and what can be done is more limited.
+    // If you want complex stuff, register soilOnDug recipes instead to have more control.
     /** @type {{elementType: CellTypeIdent, chance: number}?} */
     soilOutput = undefined;
     /** @type {{fg: Rgba, bg: Rgba} | {fg: Hsl, bg: Hsl}} */ //todo: add patternSprite
@@ -140,12 +181,14 @@ class CellTypeDefinition {
 
     /** @type {boolean} */
     // Whether this soil can be broken by bouncers. If not, bouncers with proper upgrades will bounce off this soil
-    soilBouncerBreakable = false;
-    soilDamagableFunction = undefined; // todo
+    soilBouncerBreakable = false; // todo
 
     soilIsFog = false;
-    soilBackgroundElementType = undefined;
-    soilFogUncoverFunc = undefined;
+    soilFogPreventTriggerUncover = false;
+    // This is the element type that this soil will output when unfog.
+    // If you want more complex control on unfog, use the soilOnUnfog recipe instead
+    /** @type {CellTypeIdent?} */
+    soilFogBackgroundElementType = undefined;
 
     /** @type {(cell: Element, elmColorMap: {[ElmId: number]: ([Rgba] | [Rgba, Rgba, Rgba, Rgba])})=>Rgba} */
     elementColorVarientSelectionFunction = undefined;
@@ -169,6 +212,13 @@ class CellTypeDefinition {
     elementMatterState = "Solid";
     /** @type {number?} */
     elementLifeDuration = undefined;
+
+    /** @type {Event<ElementCtx>?} */
+    // If defined, this function will be called when the element's 'duration' countdown is done
+    // Return false to cancel the element's duration end event letting it tick normally,
+    // Return true to complete duration end event skipping usual actions (normally deleting the element),
+    // or return nothing to continue the end event with usual actions (like deleting the element)
+    elementDurationEndEvent = undefined;
     /** @type {(()=>{data: any})?} */
     elementGetExtraProps = undefined;
     /** @type {boolean} */
@@ -185,14 +235,13 @@ class CellTypeDefinition {
             [hue, cmp(sat+2), cmp(val+1)],
             [hue, cmp(sat+8), cmp(val+4)]
         ];
-        console.log(result);
         return result;
     }
 }
 
 // #endregion Headers / Class Defs
-// === Actual using the stuff ===
 
+// === Actual using the stuff ===
 
 /** @type {LibLoaderEvents} */
 exports.LibLoaderEvents = {
@@ -211,6 +260,59 @@ exports.LibLoaderEvents = {
             return { data: { counter: 5 } };
         }
         llElms.registerCellType(ct);
+
+        var ct = new CellTypeDefinition();
+        ct.id = "BurntWetSlagWater";
+        ct.displayName = "Burnt Wet Slag Water";
+        ct.metaType = "Element";
+        ct.elementColor = CellTypeDefinition.MakeDefaultColorVarients(185, 25, 20);
+        ct.hintInteractions = ["Burnt Wet Slag Water"];
+        ct.elementDensity = 200;
+        ct.elementMatterState = "Liquid";
+        ct.elementGetExtraProps = function () {
+            return { data: { counter: 5 } };
+        }
+        llElms.registerCellType(ct);
+
+        var ct = new CellTypeDefinition();
+        ct.id = "BurntWetSlagGas";
+        ct.displayName = "Burnt Wet Slag Gas";
+        ct.metaType = "Element";
+        ct.elementColor = CellTypeDefinition.MakeDefaultColorVarients(195, 25, 80);
+        ct.hintInteractions = ["Burnt Wet Slag Gas"];
+        ct.elementDensity = 20;
+        ct.elementMatterState = "Gas";
+        ct.elementGetExtraProps = function () {
+            return { data: { counter: 5 } };
+        }
+        llElms.registerCellType(ct);
+
+        var ct = new CellTypeDefinition();
+        ct.id = "BurntWetSlagSlush";
+        ct.displayName = "Burnt Wet Slag Slush";
+        ct.metaType = "Element";
+        ct.elementColor = CellTypeDefinition.MakeDefaultColorVarients(190, 15, 10);
+        ct.hintInteractions = ["Burnt Wet Slag Slush"];
+        ct.elementDensity = 150;
+        ct.elementMatterState = "Slushy";
+        ct.elementGetExtraProps = function () {
+            return { data: { counter: 5 } };
+        }
+        
+        llElms.registerCellType(ct);
+        var ct = new CellTypeDefinition();
+        ct.id = "BurntWetSlagWisp";
+        ct.displayName = "Burnt Wet Slag Wisp";
+        ct.metaType = "Element";
+        ct.elementColor = CellTypeDefinition.MakeDefaultColorVarients(195, 45, 90);
+        ct.hintInteractions = ["Burnt Wet Slag Wisp"];
+        ct.elementDensity = 10;
+        ct.elementMatterState = "Wisp";
+        ct.elementGetExtraProps = function () {
+            return { data: { counter: 5 } };
+        }
+        llElms.registerCellType(ct);
+
 
         var ct = new CellTypeDefinition();
         ct.id = "BurnTest";
@@ -261,7 +363,7 @@ exports.LibLoaderEvents = {
                 }
             )
             if (Math.random() < 0.9) {
-                return [elmTypes.BurntSlag]
+                return [-elmTypes.BurntSlag] // negative as this is an element, not soil
             };
             return []
         }});
@@ -279,7 +381,13 @@ exports.LibLoaderEvents = {
         llElms.registerBasicInteractionRecipe("WetSand", "Basalt", "Sandium");
         llElms.registerBasicInteractionRecipe("Sandium", "Water", "Basalt");
 
-        llElms.registerComplexInteractionRecipe({key: "Basalt", constraint: "BurntWetSlag", result: [{type: "Sandium", amount: [15, 20]}]});
+        llElms.registerBasicInteractionRecipe("Water", "BurntWetSlagWater", "BurntWetSlagSlush");
+        llElms.registerBasicInteractionRecipe("Slag", "BurntWetSlagSlush", "BurntWetSlagGas");
+        llElms.registerBasicInteractionRecipe("Steam", "BurntWetSlagGas", "BurntWetSlagWisp");
+        llElms.registerBasicInteractionRecipe("Petalium", "BurntWetSlagWisp", "BurntWetSlagWater");
+
+
+        llElms.registerComplexInteractionRecipe({key: "Basalt", constraint: "BurntWetSlag", result: [{type: "SandSoil", amount: [15, 20]}]});
 
         ct = new CellTypeDefinition();
         ct.id = "BurntWetSlagSoilFog"; 
@@ -288,6 +396,55 @@ exports.LibLoaderEvents = {
         ct.soilHp = 1; // not sure why
         ct.soilBackgroundElementType = "BurntWetSlag";
         ct.soilIsFog = true;
+        llElms.registerCellType(ct);
+
+        ct = new CellTypeDefinition();
+        ct.id = "BurntWetSlagJumpy";
+        ct.metaType = "Element";
+        ct.hintInteractions = ["Jump!"];
+        ct.elementColor = CellTypeDefinition.MakeDefaultColorVarients(200, 80, 50);
+        ct.elementDensity = 100;
+        ct.elementMatterState = "Solid";
+        ct.elementLifeDuration = 1; // 1 second
+        ct.elementDurationEndEvent = function (ctx) {
+            var api = ctx.api;
+            var elm = ctx.cell;
+            elm.duration.left = (Math.random() * 0.5 + 0.75) * elm.duration.max; // reset the duration
+            elm.density = Math.random() * 200 + 10;
+            var founds = 0;
+            for (var oy = 0; oy > -8; oy--) {
+                if (api.isCellAtPosEmpty(ctx.global, elm.x-1, elm.y+oy) &&
+                    api.isCellAtPosEmpty(ctx.global, elm.x, elm.y+oy) &&
+                    api.isCellAtPosEmpty(ctx.global, elm.x+1, elm.y+oy)) {
+                    founds++;
+                    if (founds >= 3) {
+                        oy += 1;
+                        break;
+                    }
+                }
+                else {
+                    founds = 0;
+                }
+            }
+            //if (founds < 3) {
+                api.setCell(ctx.global, elm.x, elm.y, elm); // update the element
+                return true; // handled the event
+            //}
+            //api.clearCell(ctx.global, elm);
+            //elm.y += oy;
+            //api.launchElementAsParticle(ctx.global, elm, {x: (Math.random()-0.5)*50, y: -50 + Math.random()*-50});
+            return true; // handled the event
+
+            // if (api.trySpawnElementsAroundPos(ctx.global, elm.x, elm.y-10, [elm.type],
+            //     [elm.x-1, elm.y-10, elm.x+1, elm.y-8], {allowNonTouching: true})) {
+            //     api.clearCell(ctx.global, elm);
+            //     return true; // handled the event
+            // }
+            // else {
+            //     elm.duration.left = elm.duration.max; // reset the duration
+            //     return false; // cancel the event, let the ticking happen
+            // }
+        }
         llElms.registerCellType(ct);
     }
 }

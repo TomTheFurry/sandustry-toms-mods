@@ -1,7 +1,7 @@
 
 exports.modinfo = {
     name: "ll-elements",
-    version: "0.2.2",
+    version: "0.3.0",
     dependencies: [],
     modauthor: "TomTheFurry",
 };
@@ -29,6 +29,17 @@ exports.modinfo = {
 // - Fixed incorrect handling of the various callback results in phyiscs crafting
 // v.2.2 hotfix:
 // - Add missing patch to handle vanilla bug with damagable soil colors
+// v.3 updates:
+// - Added shaker recipes via `registerShakerRecipe(...)`
+// - Added ability to add stuff into shaker filter via `registerShakerFilterAllow(...)`
+// - Updated how basic interaction recipes works, such that it can output soil types
+// - Updated all recipes to support soil type outputs as well, as element type output
+//   is denoted by being negative
+// - Added soil on dug recipes via `registerSoilDugRecipe(...)`
+// - fixed binding `getCellAtPos` to accept the `global` instead of `store`
+// - added binding `trySpawnCellsAroundPos` that supports both soils and elements
+// - added binding `tryAroundPos` for your custom logic for scnaning around a position
+// - impl refactor, to make callbacks handling more uniform
 
 // ==== Headers / Class Defs ====
 // #region Headers / Class Defs
@@ -76,6 +87,9 @@ class PhysicBinding {
     /** @type {(global, targetPosX: number, targetPosY: number)=>Cell} */
     getCellAtPos;
 
+    /** @type {(store, targetPosX: number, targetPosY: number)=>Cell} */
+    getCellAtPosFromStore;
+
     /** @type {(elementType: number, posX: number, posY: number, extraProperties?: object)=>Element} */
     newElementInstance;
 
@@ -84,13 +98,37 @@ class PhysicBinding {
      *  @type {(global, posX: number, posY: number, elementsToSpawn: ElementType[],
      *          area: [[minX:number, minY:number],[maxX:number, maxY:number]],
      *          opts?: {
-     *              condition?: (posX: number, posY: number)=>boolean,
-     *              spawner?: (posX: number, posY: number, elmType: number, idx: number)=>Element,
+     *              condition?: (posX: number, posY: number)=>boolean?,
+     *              spawner?: (posX: number, posY: number, elmType: number, idx: number)=>Element?,
      *               weakBatching?: boolean,
      *              allowNonTouching?: boolean,
      *          }) => boolean}
     */
     trySpawnElementsAroundPos;
+
+    /**
+     *  @type {(global, posX: number, posY: number, cellsToSpawn: number[],
+     *          area: [[minX:number, minY:number],[maxX:number, maxY:number]],
+     *          opts?: {
+     *              condition?: (posX: number, posY: number)=>boolean?,
+     *              spawner?: (posX: number, posY: number, cellType: number, idx: number)=>Cell?,
+     *               weakBatching?: boolean,
+     *              allowNonTouching?: boolean,
+     *          }) => boolean}
+    */
+    trySpawnCellsAroundPos;
+
+    /**
+     *  @type {(posX: number, posY: number, count: number,
+     *          area: [[minX:number, minY:number],[maxX:number, maxY:number]],
+     *          condition: (posX: number, posY: number)=>boolean?,
+     *          action: (posX: number, posY: number, idx: number)=>void,
+     *          opts?: {
+     *               weakBatching?: boolean,
+     *               allowNonTouching?: boolean,
+     *          }) => boolean}
+    */
+    tryAroundPos;
 }
 
 /**
@@ -101,7 +139,8 @@ class PhysicBinding {
  * @typedef {string} CellTypeIdent
  * @typedef {[number, number, number, number]} Rgba
  * @typedef {[number, number, number]} Hsl
- * @typedef {Element | number} Cell
+ * @typedef {Element | DamagedSoil | number} Cell
+ * @typedef {{cellType: number, hp: number}} DamagedSoil
  * @typedef {{
  *  type: number,
  *  x: number,
@@ -116,8 +155,10 @@ class PhysicBinding {
  * }} Element
  * @typedef {{element: Element} & Element} Particle
  * @typedef {{x:number, y:number}} Vec2
- * @typedef {{api: PhysicBinding, global, cell: Element}} PhysicCtx
- * @typedef {PhysicCtx & {otherCell: Element}} InteractionCtx
+ * @typedef {{api: PhysicBinding, global}} GameCtx
+ * @typedef {GameCtx & {cell: Element}} ElementCtx
+ * @typedef {ElementCtx & {otherCell: Element}} InteractionCtx
+ * @typedef {GameCtx & {cell: Cell, x: number, y: number}} CellCtx
  * @typedef {CellTypeIdent | {type: CellTypeIdent, amount: (Number | [Number, Number])}} RecipeResultEntry
  * @typedef {(RecipeResultEntry | RecipeResultEntry[])} RecipeResult
  * @typedef {number | {type: number, amount: (Number | [Number, Number])}} RuntimeRecipeResultEntry
@@ -136,18 +177,10 @@ const CellMetaTypes = ["Soil", "Element", "Particle"]
  */
 const MatterTypes = ["Solid", "Liquid", "Particle", "Gas", "Static", "Slushy", "Wisp"]
 
-/**
- * @template {PhysicCtx} TCtx
- * @typedef {{key: CellTypeIdent, result: RecipeResult | (ctx:TCtx)=>RuntimeRecipeResult}} Recipe<TCtx>
- */
-/**
- * @template {PhysicCtx} TCtx
- * @typedef {{key: CellTypeIdent, result: RuntimeRecipeResult | (ctx:TCtx)=>RuntimeRecipeResult}} RuntimeRecipe<TCtx>
- */
-/**
- * @template {PhysicCtx} TCtx
- * @typedef {(ctx:TCtx)=>boolean|void} Event<TCtx>
- */
+/** @template {GameCtx} TCtx @typedef {(ctx:TCtx)=>(RuntimeRecipeResult|boolean)} RuntimeRecipeCallback<TCtx> */
+/** @template {GameCtx} TCtx @typedef {(ctx:TCtx)=>boolean|void} Event<TCtx> */
+/** @template {GameCtx} TCtx @typedef {{key: CellTypeIdent, result: RecipeResult | (ctx:TCtx)=>(RuntimeRecipeResult|boolean)}} Recipe<TCtx> */
+/** @template {GameCtx} TCtx @typedef {{key: CellTypeIdent, result: RuntimeRecipeResult | (ctx:TCtx)=>RuntimeRecipeResult}} RuntimeRecipe<TCtx> */
 
 class CellTypeDefinition {
     /** @type {CellMetaType} */
@@ -156,7 +189,7 @@ class CellTypeDefinition {
     id; // type identifier
     /** @type {number} */
     runtimeIdx = -1; // runtime index, propulated by loaders. Either cell type id or element type id, depending on metaType    
-    /** @type {number | Hsl | Hsl[] | Rgba[] | (ctx:PhysicCtx)=>Rgba} */
+    /** @type {number | Hsl | Hsl[] | Rgba[] | (ctx:ElementCtx)=>Rgba} */
     //pixelColors = [[255, 0, 0, 255]]; // pixel colors, mapped by varients
     /** @type {string?} */
     displayName; // display name. If null, use id
@@ -174,6 +207,8 @@ class CellTypeDefinition {
     // hsl color, or the hue color, or, if soil output is defined, can be null
     /** @type {Hsl?} */
     soilColorHsl = undefined;
+    // Soil Output: This is for vanilla on dug handling and what can be done is more limited.
+    // If you want complex stuff, register soilOnDug recipes instead to have more control.
     /** @type {{elementType: CellTypeIdent, chance: number}?} */
     soilOutput = undefined;
     /** @type {{fg: Rgba, bg: Rgba} | {fg: Hsl, bg: Hsl}} */ //todo: add patternSprite
@@ -182,12 +217,13 @@ class CellTypeDefinition {
     /** @type {boolean} */
     // Whether this soil can be broken by bouncers. If not, bouncers with proper upgrades will bounce off this soil
     soilBouncerBreakable = false; // todo
-    soilDamagableFunction = undefined; // todo
 
     soilIsFog = false;
     soilFogPreventTriggerUncover = false;
-    soilBackgroundElementType = undefined;
-    soilFogUncoverFunc = undefined;
+    // This is the element type that this soil will output when unfog.
+    // If you want more complex control on unfog, use the soilOnUnfog recipe instead
+    /** @type {CellTypeIdent?} */
+    soilFogBackgroundElementType = undefined;
 
     /** @type {(cell: Element, elmColorMap: {[ElmId: number]: ([Rgba] | [Rgba, Rgba, Rgba, Rgba])})=>Rgba} */
     elementColorVarientSelectionFunction = undefined;
@@ -212,7 +248,7 @@ class CellTypeDefinition {
     /** @type {number?} */
     elementLifeDuration = undefined;
 
-    /** @type {Event?} */
+    /** @type {Event<ElementCtx>?} */
     // If defined, this function will be called when the element's 'duration' countdown is done
     // Return false to cancel the element's duration end event letting it tick normally,
     // Return true to complete duration end event skipping usual actions (normally deleting the element),
@@ -239,6 +275,7 @@ class CellTypeDefinition {
 }
 
 // #endregion Headers / Class Defs
+
 // ==== Implementation ====
 // #region Implementation
 
@@ -260,15 +297,28 @@ const PatchColorIdOverflow = true;
 
 class LibElementsApi /** @implements {LibApi} */ {
     id = "LibElementsApi";
-    version = "2.0.0";
-    /** @type {Recipe<PhysicCtx>[]} */
+    version = "3.0.0";
+    /** @type {Recipe<ElementCtx>[]} */
     KineticRecipes = [];
     /** @type {Recipe<InteractionCtx>[]} */
     BurnableRecipes = [];
-    /** @type {{[a: CellTypeIdent]: {[b: CellTypeIdent]: CellTypeIdent}}} */
+    /** @type {Recipe<ElementCtx[]>} */
+    ShakerRecipes = [];
+
+    /** @type {CellTypeIdent[]} */
+    ShakerFilterAllows = [];
+
+    /** @type {{[top: CellTypeIdent]: {[bottom: CellTypeIdent]: [top: CellTypeIdent, bottom?: CellTypeIdent]}}} */
     BasicInteractionRecipes = {};
     /** @type {Recipe<InteractionCtx>[]} */
     ComplexInteractionRecipes = [];
+
+    /** @type {Recipe<CellCtx>[]} */
+    DigRecipes = [];
+    /** @type {Recipe<CellCtx>[]} */
+    SoilDugRecipes = [];
+    /** @type {Recipe<CellCtx>[]} */
+    SoilUnfogRecipes = [];
 
     /** @type {CellTypeDefinition[]} */
     CellTypeDefinitions = [];
@@ -277,7 +327,7 @@ class LibElementsApi /** @implements {LibApi} */ {
     registerCellType(cellType) {
         this.CellTypeDefinitions.push(cellType);
     };
-    /** @param {Recipe<PhysicCtx>} recipe */
+    /** @param {Recipe<ElementCtx>} recipe */
     registerKineticRecipe(recipe) {
         this.KineticRecipes.push(recipe);
     };
@@ -285,18 +335,46 @@ class LibElementsApi /** @implements {LibApi} */ {
     registerBurnableRecipe(recipe) {
         this.BurnableRecipes.push(recipe);
     };
+    /** @param {Recipe<ElementCtx[]>} recipe */
+    registerShakerRecipe(recipe) {
+        this.ShakerRecipes.push(recipe);
+    };
+
+    /** @param {CellTypeIdent} cellType */
+    registerShakerFilterAllow(cellType) {
+        this.ShakerFilterAllows.push(cellType);
+    };
+
     /** @param {Recipe<InteractionCtx>} recipe */
     registerComplexInteractionRecipe(recipe) {
         this.ComplexInteractionRecipes.push(recipe);
     }
-    /** @param {CellTypeIdent} elmOnTop @param {CellTypeIdent} elmOnBottom */
-    registerBasicInteractionRecipe(elmOnTop, elmOnBottom, result, doubleAmount = false) {
+    /** @param {CellTypeIdent} elmOnTop @param {CellTypeIdent} elmOnBottom @param {CellTypeIdent} resultOnTop @param {CellTypeIdent} resultOnBottom */
+    registerBasicInteractionRecipe(elmOnTop, elmOnBottom, resultOnTop, resultOnBottom = undefined) {
+        if (resultOnBottom === true) {
+            // legacy api support, this means double amount of the top element
+            resultOnBottom = resultOnTop;
+        }
+        if (resultOnBottom === false) {
+            // legacy api support, this means no bottom element
+            resultOnBottom = undefined;
+        }
         if (!this.BasicInteractionRecipes[elmOnTop]) this.BasicInteractionRecipes[elmOnTop] = {};
-        this.BasicInteractionRecipes[elmOnTop][elmOnBottom] = result;
-        if (!doubleAmount) return;
-        if (!this.BasicInteractionRecipes[elmOnBottom]) this.BasicInteractionRecipes[elmOnBottom] = {};
-        this.BasicInteractionRecipes[elmOnBottom][elmOnTop] = result;
+        this.BasicInteractionRecipes[elmOnTop][elmOnBottom] = [resultOnTop, resultOnBottom];
     }
+
+    /** @param {Recipe<CellCtx>} recipe */
+    registerDigRecipe(recipe) {
+        this.DigRecipes.push(recipe);
+    };
+    /** @param {Recipe<CellCtx>} recipe */
+    registerSoilDugRecipe(recipe) {
+        this.SoilDugRecipes.push(recipe);
+    };
+    /** @param {Recipe<CellCtx>} recipe */
+    registerSoilUnfogRecipe(recipe) {
+        this.SoilUnfogRecipes.push(recipe);
+    };
 
     impl = {
         /** @param {LibAccess} ll */
@@ -318,7 +396,7 @@ class LibElementsApi /** @implements {LibApi} */ {
                 isCellAtPosEmpty:          ["tf", "lV", "lV"],
                 moveOrSwapElementToPos:    ["nf", "Hs", "Hs"],
                 getElementTypeAtPos:       ["rf", "QC", "QC"],
-                getCellAtPos:              ["Bd", "tT", "tT"],
+                getCellAtPosFromStore:              ["Bd", "tT", "tT"],
                 markChunkActive:           ["Hd", "Y$", "Y$"],
                 newElementInstance:        ["Fh", ["n","S"], ["n","g"]],
             }
@@ -363,7 +441,7 @@ class LibElementsApi /** @implements {LibApi} */ {
             bindingMake("isCellAtPosEmpty");
             bindingMake("moveOrSwapElementToPos");
             bindingMake("getElementTypeAtPos");
-            bindingMake("getCellAtPos");
+            bindingMake("getCellAtPosFromStore");
             bindingMake("markChunkActive");
             bindingMake("newElementInstance");
         }
@@ -621,7 +699,6 @@ class LibElementsApi /** @implements {LibApi} */ {
             var soilSolidIds = [];
             var soilFogIds = [];
             var soilFogToResultMapping = {};
-            var soilFogToSpecialMapping = {}; //todo
             // validate and patch in the base soil configs
             {
                 var configCopy = [];
@@ -643,15 +720,16 @@ class LibElementsApi /** @implements {LibApi} */ {
                         else throw new Error(`ll-elements: Soil ${ct.id} colors fg '${fg}' and bg '${gb}' must be either in hsl or rgba!`);
                         ct.soilColorWithBackground.model = type;
                     }
-                    if (ct.soilBackgroundElementType) {
-                        if (!ct.soilIsFog) throw new Error(`ll-elements: Soil ${ct.id} background element type '${ct.soilBackgroundElementType}' only valid if soilIsFog is true!`);
-                        if (!(typeof ct.soilBackgroundElementType === "string"))
-                            throw new Error(`ll-elements: Soil ${ct.id} background element type '${ct.soilBackgroundElementType}' must be a string!`);
+                    if (ct.soilFogBackgroundElementType) {
+                        if (!ct.soilIsFog) throw new Error(`ll-elements: Soil ${ct.id} background element type '${ct.soilFogBackgroundElementType}' only valid if soilIsFog is true!`);
+                        if (!(typeof ct.soilFogBackgroundElementType === "string"))
+                            throw new Error(`ll-elements: Soil ${ct.id} background element type '${ct.soilFogBackgroundElementType}' must be a string!`);
                     }
                     if (ct.soilOutput) {
                         if (!(typeof ct.soilOutput.elementType === "string") || !(typeof ct.soilOutput.chance === "number"))
                             throw new Error(`ll-elements: Soil ${ct.id} output '${ct.soilOutput}' must have 'elementType: string' and 'chance: number' defined!`);
                     }
+
                     // varify color can be found
                     if (!ct.soilIsFog && !ct.soilColorHsl && !ct.soilOutput) {
                         globalThis.logError(`ll-elements: Soil ${ct.id} no colors are defined!`);
@@ -665,8 +743,8 @@ class LibElementsApi /** @implements {LibApi} */ {
                     if (ct.soilIsFog && ct.soilFogUncoverFunc) {
                         throw new Error(`ll-elements: Soil ${ct.id} fog uncover function is not supported!`);
                     }
-                    else if (ct.soilIsFog && ct.soilBackgroundElementType) {
-                        soilFogToResultMapping[ct.id] = ct.soilBackgroundElementType;
+                    else if (ct.soilIsFog && ct.soilFogBackgroundElementType) {
+                        soilFogToResultMapping[ct.id] = ct.soilFogBackgroundElementType;
                     }
 
                     var soilDef = {
@@ -678,7 +756,7 @@ class LibElementsApi /** @implements {LibApi} */ {
                         output: (ct.soilOutput) ? {
                             elementType: ct.soilOutput.elementType,
                             chance: ct.soilOutput.chance} : undefined,
-                        backgroundElementType: ct.soilBackgroundElementType ?? undefined,
+                        backgroundElementType: ct.soilFogBackgroundElementType ?? undefined,
                         background: (ct.soilColorWithBackground) ? {
                             model: ct.soilColorWithBackground.model,
                             fg: ct.soilColorWithBackground.fg,
@@ -740,91 +818,337 @@ class LibElementsApi /** @implements {LibApi} */ {
                         globalThis.hookOnFlameEndSpawnOutput(${glb},${elm});
                         return true;var `
                 ); // only exist in 336
-
-                // next, the actually inject the recipes, by assigning it to 'globalThis.BurnableRecipesSource'
-                var recipesFormatted = [];
-                for (var i = 0; i < this.BurnableRecipes.length; i++) {
-                    var recipe = this.BurnableRecipes[i];
-                    if (!recipe.key) throw new Error(`ll-elements: Burnable recipe ${recipe} doesn't have a key!`);
-                    if (recipe.result instanceof Function) {
-                        // serialize func
-                        recipe.resultFunc = `return ${recipe.result.toString()}`;
-                        delete recipe.result;
+                helper_injectRecipes(ll, "Burnable", this.BurnableRecipes,
+                    (global, cell, hotElm) => {
+                        /** @type {PhysicBinding} */
+                        var binding = globalThis.physicsBindingApi;
+                        /** @type {{[id:number]:RuntimeRecipe<ElementCtx>}} */
+                        var burnRecipes = globalThis.BurnableRecipes;
+                        if (!binding.cellIsElement(cell)) return false; // not a element
+                        /** @type {Element} */
+                        var elm = cell;
+                        var recipe = burnRecipes[-elm.type];
+                        if (!recipe) return false; // no mapped recipe for this element
+                        var result = globalThis.recipeEvalAndProcess("Burnable", recipe, {api:binding, global:global, cell:elm, otherCell: hotElm});
+                        if (typeof result === "boolean") return result;
+                        var newFlame = binding.newElementInstance(globalThis.Hook_ElementType.Flame, cell.x, cell.y);
+                        newFlame.data = {output: result};
+                        binding.setCell(global, cell.x, cell.y, newFlame);
+                        return true;
                     }
-                    recipesFormatted.push(recipe);
+                )
+                /** @type {(global, flame: Element)=>void} */
+                var hookOnFlameEndSpawnOutput = (global, flameElm) => {
+                    /** @type {PhysicBinding} */
+                    var binding = globalThis.physicsBindingApi;
+                    /** @type {{elementType: number, chance: number} | number[] | null} */
+                    var elmDataOutput = flameElm.data?.output;
+                    var x = flameElm.x;
+                    var y = flameElm.y;
+                    if (elmDataOutput) {
+                        var result;
+                        if (!Array.isArray(elmDataOutput)) {
+                                result = elmDataOutput.elementType !== false
+                                    && Math.random() < (elmDataOutput.chance ?? 1) ? [elmDataOutput.elementType] : [];
+                        }
+                        else {
+                            result = elmDataOutput;
+                            globalThis.llLogVerbose("ll-elements: Flame end result:", result);
+                        }
+                        if (result.length > 1) {
+                            var findAllSpot = binding.trySpawnCellsAroundPos(global, x, y,
+                                result.slice(1), [[x-3,y-3],[x+3,y+3]]);
+                            if (!findAllSpot) {
+                                // let it live
+                                var newElm = binding.newElementInstance(flameElm.type, x, y);
+                                newElm.data = flameElm.data;
+                                binding.setCell(global, x, y, newElm);
+                                return;
+                            }
+                            // let the ==1 case deal with spawning the first one
+                        }
+                        if (result.length == 1) {
+                            var newCell = result[0] >= 0 ? result[0] : binding.newElementInstance(-result[0], x, y);
+                            binding.setCell(global, x, y, newCell);
+                            return;
+                        }
+                    }
+                    // otherwise, set it to 'fire'
+                    var deadElm = binding.newElementInstance(globalThis.Hook_ElementType.Fire, x, y);
+                    binding.setCell(global, x, y, deadElm);
                 }
-                var json = JSON.stringify(recipesFormatted);
-                console.log("Burnable Recipes:", recipesFormatted);
-                ll.AddInjectionToScriptHeading(`globalThis.BurnableRecipesSource = ${json};`);
-
-                // next, patch in the hook call where burn stuff happens (sparkFlameAtPos func)
+                ll.AddInjectionToScriptHeading(`globalThis.hookOnFlameEndSpawnOutput = ${hookOnFlameEndSpawnOutput.toString()};`);
+                // patch in the hook call where burn stuff happens (sparkFlameAtPos func)
                 // expects 2, because one is flamethrower, and the other is the normal fire by lava/flame
                 ll.AddPatternPatches(
                     {"336":["e","n","i.RJ","a","(0,c.af)"]},
                     (glb,elm,elmType,hotElm,v1) => `}if(${v1}(${elm},${elmType}.Slag))`,
                     (glb,elm,elmType,hotElm,v1) => `}
-                        if (globalThis.hookOnSparkFlameAtPos(${glb},${elm},${hotElm})) return;
+                        if (globalThis.hookOnBurnableRecipe(${glb},${elm},${hotElm})) return;
                         if(${v1}(${elm},${elmType}.Slag))`,
                 2);
             }
             { // next, the kinetic press recipes
-                // inject the recipes, by assigning it to 'globalThis.KineticRecipesSource'
-                var recipesFormatted = [];
-                for (var i = 0; i < this.KineticRecipes.length; i++) {
-                    var recipe = this.KineticRecipes[i];
-                    if (!recipe.key) throw new Error(`ll-elements: Kinetic recipe ${recipe} doesn't have a key!`);
-                    if (recipe.result instanceof Function) {
-                        // serialize func
-                        recipe.resultFunc = `return ${recipe.result.toString()}`;
-                        delete recipe.result;
+                helper_injectRecipes(ll, "KineticPress", this.KineticRecipes,
+                    (global, elm) => {
+                        if (elm.velocity.y < 200) return false;
+                        /** @type {PhysicBinding} */
+                        var binding = globalThis.physicsBindingApi;
+                        /** @type {RuntimeRecipe<ElementCtx>} */
+                        var recipe = globalThis.KineticPressRecipes[-elm.type];
+                        if (!recipe) return false; // no mapped recipe for this element
+                        var result = globalThis.recipeEvalAndProcess("KineticPress", recipe, {api:binding, global:global, cell:elm});
+                        if (typeof result === "boolean") return result;
+                        if (result.length == 0) return true;
+                        var snapGridFloor = v => Math.floor(v / 4) * 4;
+                        var snapGridCeil = v => Math.ceil(v / 4) * 4;
+                        if (binding.trySpawnCellsAroundPos(global, elm.x, elm.y+2, result,
+                            [[snapGridFloor(elm.x), elm.y+2], [snapGridCeil(elm.x), elm.y+4]], {allowNonTouching: true})) {
+                            binding.clearCell(global, elm);
+                            return true;
+                        }
+                        return false;
                     }
-                    recipesFormatted.push(recipe);
-                }
-                var json = JSON.stringify(recipesFormatted);
-                console.log("Kinetic Recipes:", recipesFormatted);
-                ll.AddInjectionToScriptHeading(`globalThis.KineticRecipesSource = ${json};`);
-
-                // next, patch in the hook call where kinetic stuff happens (checkKineticPress func)
+                );
+                // patch in the hook call where kinetic stuff happens (checkKineticPress func)
                 ll.AddPatternPatches(
                     {"main":["r","i","s","t"], "515":["e","t","r","n.vZ"]},
                     (glb,elm,cb,cType) => `=function(${glb},${elm},${cb}){return!(${cb}!==${cType}.VelocitySoaker||`,
                     (glb,elm,cb,cType) => `=function(${glb},${elm},${cb}){
                         if (${cb}!==${cType}.VelocitySoaker) return false;
-                        if (globalThis.hookOnKineticPress(${glb},${elm})) return true;
+                        if (globalThis.hookOnKineticPressRecipe(${glb},${elm})) return true;
                     return!(`
                 );
             }
-            { 
-                // next, the interaction recipes
-                var table = this.BasicInteractionRecipes;
-                ll.AddInjectionToScriptHeading(`globalThis.BasicInteractionRecipesSource = ${JSON.stringify(table)};`);
-
-                // the complex interaction recipes
-                var recipesFormatted = [];
-                for (var i = 0; i < this.ComplexInteractionRecipes.length; i++) {
-                    var recipe = this.ComplexInteractionRecipes[i];
-                    if (!recipe.key) throw new Error(`ll-elements: Interaction recipe ${recipe} doesn't have a key!`);
-                    if (recipe.result instanceof Function) {
-                        // serialize func
-                        recipe.resultFunc = `return ${recipe.result.toString()}`;
-                        delete recipe.result;
+            { // next, the shaker recipes
+                // patch in the hook call
+                ll.AddPatternPatches(
+                    {"main":["s","r","t"], "336":["v","t","e"], "546":["f","t","e"]},
+                    (s,elm,glb) => `.ShakerRight].includes(${s})&&${elm}.type===`,
+                    (s,elm,glb) => `.ShakerRight].includes(${s}))
+                        var isShake = true;
+                    if (!!isShake) {
+                        if (globalThis.hookOnShakerRecipe(${glb},${elm})) return;
                     }
-                    recipesFormatted.push(recipe);
-                }
+                    if ((!!isShake) &&${elm}.type===`
+                );
+                // also patch the filter stuff
+                ll.AddPatternPatches(
+                    {"main":["n"]},
+                    (eType) => `.filter={elementType:${eType}.Gold,`,
+                    (eType) => `.filter={elementType:[${eType}.Gold${
+                        this.ShakerFilterAllows.map(v => `,${eType}.${v}`).join("")
+                    }],`
+                );
 
-                var json = JSON.stringify(recipesFormatted);
-                console.log("ComplexInteraction Recipes:", recipesFormatted);
-                ll.AddInjectionToScriptHeading(`globalThis.ComplexInteractionRecipesSource = ${json};`);
-
+                helper_injectRecipes(ll, "Shaker", this.ShakerRecipes,
+                    (global, elm) => {
+                        /** @type {PhysicBinding} */
+                        var binding = globalThis.physicsBindingApi;
+                        /** @type {RuntimeRecipe<ElementCtx>} */
+                        var recipe = globalThis.ShakerRecipes[-elm.type];
+                        if (!recipe) return false; // no mapped recipe for this element
+                        var result = globalThis.recipeEvalAndProcess("Shaker", recipe, {api:binding, global:global, cell:elm});
+                        if (typeof result === "boolean") return result;
+                        if (result.length == 0) return true;
+                        var snapGridFloor = v => Math.floor(v / 4) * 4;
+                        var snapGridCeil = v => Math.ceil(v / 4) * 4;
+                        if (binding.trySpawnCellsAroundPos(global, elm.x, elm.y, result.slice(1),
+                            [[snapGridFloor(elm.x), elm.y-4], [snapGridCeil(elm.x), elm.y]], {allowNonTouching: true})) {
+                            var newVal = result[0];
+                            if (newVal < 0) {
+                                newVal = binding.newElementInstance(-newVal, elm.x, elm.y);
+                                newVal.isFreeFalling = false;
+                            }
+                            binding.setCell(global, elm.x, elm.y, newVal);
+                            return true;
+                        }
+                        return false;
+                    }
+                );
+            }
+            { // next, the interaction recipes
+                var table = this.BasicInteractionRecipes;
+                var fixBasicInteractionRecipes = () => {
+                    globalThis.llLogVerbose(`ll-elements: Evaluating BasicInteractionRecipes...`);
+                    /** @type {{[top: string]: {[bottom: string]: [top: string, bottom?: string]}}} */
+                    var source = globalThis.BasicInteractionRecipesSource;
+                    if (!source) throw new Error(`ll-elements: BasicInteractionRecipesSource not found!`);
+                    var elmIds = globalThis.Hook_ElementType;
+                    var soilIds = globalThis.Hook_CellType;
+                    /** @type {{(ident: string)=>number}} */
+                    var fixer = (id) => {
+                        var newId = elmIds[id];
+                        newId = newId !== undefined ? -newId : soilIds[id];
+                        if (newId === undefined) throw new Error(`ll-elements: type ${id} not found!`);
+                        return newId;
+                    }
+                    var lookup = [];
+                    for (var [key, dict] of Object.entries(source)) {
+                        var keyId = fixer(key);
+                        if (keyId >= 0) throw new Error(`ll-elements: BasicInteractionRecipesSource key ${key} is not an element type!`);
+                        var newDict = [];
+                        for (var [bottomKey, to] of Object.entries(dict)) {
+                            var bottomId = fixer(bottomKey);
+                            if (bottomId >= 0) throw new Error(`ll-elements: BasicInteractionRecipesSource bottom ${bottomKey} is not an element type!`);
+                            var toTopId = to[0] != null ? fixer(to[0]) : undefined;
+                            var toBottomId = to[1] != null ? fixer(to[1]) : undefined;
+                            newDict[-bottomId] = [toTopId, toBottomId];
+                        }
+                        lookup[-keyId] = newDict;
+                    }
+                    globalThis.llLogVerbose(`ll-elements: BasicInteractionRecipes evaluated:`, lookup);
+                    return lookup;
+                };
+                ll.AddInjectionToScriptHeading(`
+                    globalThis.BasicInteractionRecipesSource = ${JSON.stringify(table)};
+                    globalThis.lazyPropSet(globalThis, "BasicInteractionRecipes", ${fixBasicInteractionRecipes.toString()});
+                `);
+                var hookOnBasicInteractionRecipe = (global, elmA, elmB) => {
+                    var table = globalThis.BasicInteractionRecipes;
+                    var result = table[elmA.type]?.[elmB.type];
+                    if (!result) return false; // no mapped recipe for this element
+                    /** @type {PhysicBinding} */
+                    var api = globalThis.physicsBindingApi;
+                    var topCell = result[0] === undefined ? undefined : result[0] >= 0 ? result[0]
+                        : api.newElementInstance(-result[0], elmA.x, elmA.y);
+                    var bottomCell = result[1] === undefined ? undefined : result[1] >= 0 ? result[1]
+                        : api.newElementInstance(-result[1], elmA.x, elmA.y);
+                    topCell === undefined ? api.clearCell(global, elmA)
+                        : api.setCell(global, elmA.x, elmA.y, topCell);
+                    bottomCell === undefined ? api.clearCell(global, elmB)
+                        : api.setCell(global, elmB.x, elmB.y, bottomCell);
+                    return true;
+                };
+                ll.AddInjectionToScriptHeading(`globalThis.hookOnBasicInteractionRecipe = ${hookOnBasicInteractionRecipe.toString()};`);
                 ll.AddPatternPatches(
                     {"main":["Kc","r","i","s","o"], "515":["c","e","t","r","i"]},
                     (tb,glb,elmA,elmB,v1) => `,!0;var ${v1}=${tb}[${elmB}.type];return!!`,
                     (tb,glb,elmA,elmB,v1) => `,!0;
-                        if (globalThis.hookOnComplexInteraction(${glb},${elmA},${elmB})) return true;
-                        if (!globalThis.hookDone_BasicInteractionRecipesSource) {
-                            globalThis.hookDone_BasicInteractionRecipesSource = true;
-                            globalThis.hookInitBasicInteractionRecipes(${tb});
-                        };var ${v1}=${tb}[${elmB}.type];return!!`
+                        if (globalThis.hookOnComplexInteractionRecipe(${glb},${elmA},${elmB})) return true;
+                        if (globalThis.hookOnBasicInteractionRecipe(${glb},${elmA},${elmB})) return true;
+                        var ${v1}=${tb}[${elmB}.type];return!!`
+                );
+                // the complex interaction recipes
+                helper_injectRecipes(ll, "ComplexInteraction", this.ComplexInteractionRecipes,
+                    (global, elm, elmB) => {
+                        /** @type {PhysicBinding} */
+                        var binding = globalThis.physicsBindingApi;
+                        var recipes = globalThis.ComplexInteractionRecipes;
+                        var recipe = recipes[elm.type];
+                        if (!recipe) return false; // no mapped recipe for this element
+                        if (recipe.constraint && recipe.constraint !== elmB.type) return false;
+                        var result = globalThis.recipeEvalAndProcess("ComplexInteraction", recipe, {api:binding, global:global, cell:elm, otherCell: elmB});
+                        if (typeof result === "boolean") return result;
+                        var x = elm.x;
+                        var y = elm.y;
+                        if (result.length == 1 || binding.trySpawnCellsAroundPos(global, x, y, result.slice(1), [[x-3,y-3],[x+3,y+3]])) {
+                            binding.setCell(global, x, y, result[0] >= 0 ? result[0] : binding.newElementInstance(-result[0], x, y));
+                            return true;
+                        }
+                        return false;
+                    }, (v) => {
+                        if (v.key >= 0) throw new Error(`ll-elements: ComplexInteractionRecipes key ${v.key} is not a element type!`);
+                        v.key = -v.key;
+                        // also patch the 'constraint' property
+                        if (v.constraint) {
+                            var id = globalThis.Hook_ElementType[v.constraint];
+                            if (id === undefined) throw new Error(`ll-elements: Element type ${v.constraint} not found!`);
+                            v.constraint = id;
+                        }
+                    }    
+                );
+            }
+            { // next, soil dig & dug recipes
+                ll.AddPatternPatches(
+                    {
+                        "main":["e","a","n","r","s","o","s"],
+                        "336":["e","d","t","r","a","i","o"],
+                        "546":["e","u","t","n","r","o","i"]
+                    },
+                    (glb,cell,x,y,v,dSrc,dmg) => `(${cell})){if(Number.isInteger(${cell})){if(${cell}===`,
+                    (glb,cell,x,y,v,dSrc,dmg) => `(${cell})){
+                    if (globalThis.hookOnDigRecipe(${glb},${cell},${x},${y},${v},${dSrc},${dmg})) return;
+                    if(Number.isInteger(${cell})){if(${cell}===`,
+                )
+                ll.AddPatternPatches(
+                    {
+                        "main":["e","r","i","s","o"],
+                        "336":["e","r","l","d","u"],
+                        "546":["e","n","l","u","c"]
+                    },
+                    (glb,cell,x,y,v) => `(${glb},${x},${y});else if(${cell}===`,
+                    (glb,cell,x,y,v) => `(${glb},${x},${y});
+                    else var noReturn = true;
+                    if (noReturn === undefined) return;
+                    if (globalThis.hookOnSoilDugRecipe(${glb},${cell},${x},${y},${v})) return;
+                    else if(${cell}===`,
+                )
+                helper_injectRecipes(ll, "Dig", this.DigRecipes,
+                    (global, cell, x, y, v, dSrc, dmg) => {
+                        /** @type {PhysicBinding} */
+                        var binding = globalThis.physicsBindingApi;
+                        var recipe;
+                        if (binding.cellIsElement(cell)) {
+                            recipe = globalThis.DigRecipes[-cell.type];
+                        }
+                        else {
+                            recipe = globalThis.DigRecipes[cell.cellType ?? cell];
+                        }
+                        if (!recipe) return false; // no mapped recipe for this element
+                        var result = globalThis.recipeEvalAndProcess("Dig", recipe, {api:binding, global:global, cell:cell, x:x, y:y, velocity: v, digSource: dSrc, damage: dmg});
+                        if (typeof result === "boolean") return result;
+                        // Note default handling here is flipped compared to others,
+                        // Thats cause we want to cancel if it fails, not if it succeeds.
+                        if (result.length == 0) return false;
+                        if (!binding.trySpawnCellsAroundPos(global, x, y, result, [[x-3,y-3],[x+3,y+3]])) {
+                            return true;
+                        }
+                        return false;
+                    },
+                );
+                helper_injectRecipes(ll, "SoilDug", this.SoilDugRecipes,
+                    (global, cellType, posX, posY, vel) => {
+                        /** @type {PhysicBinding} */
+                        var binding = globalThis.physicsBindingApi;
+                        var recipe = globalThis.SoilDugRecipes[cellType];
+                        if (!recipe) return false; // no mapped recipe for this element
+                        var result = globalThis.recipeEvalAndProcess("SoilDug", recipe, {api:binding, global:global, cell:cellType, x:posX, y:posY, velocity: vel});
+                        if (typeof result === "boolean") return result;
+                        if (result.length == 0) return true;
+                        var spawnerWithVel = (x,y,t,_) => {
+                            if (t >= 0) return t;
+                            var elmType = -t;
+                            var elm = binding.newElementInstance(elmType, x, y);
+                            var newVel = {
+                                x: Math.random() * -vel.x/2 - vel.x/2,
+                                y: -Math.abs(vel.y) * (1+Math.random()*0.3)
+                            }
+                            binding.launchElementAsParticle(global, elm, newVel);
+                        }
+                        var allowSkips = new Set(result);
+                        allowSkips.add(cellType);
+                        if (result.length > 1
+                        && !binding.trySpawnCellsAroundPos(global, posX, posY, result.slice(1), [[posX-10,posY-10],[posX+10,posY+10]],
+                            {
+                                spawner: spawnerWithVel,
+                                condition: (x,y) => {
+                                    var dx = x - posX;
+                                    var dy = y - posY;
+                                    if (dx*dx + dy*dy > 100) return false; // outside the range
+                                    var c = binding.getCellAtPos(global, x, y);
+                                    if (binding.cellIsEmpty(c)) return true;
+                                    if (c.element !== undefined) c = c.element;
+                                    var cType = binding.cellIsElement(c) ? -c.type : (c.cellType ?? null);
+                                    return allowSkips.has(cType) ? null : false;
+                                }
+                            })) {
+                            binding.setCell(global, posX, posY, {cellType: cellType, hp: 1});
+                            return true; // cancel the default handling either way here
+                        }
+                        spawnerWithVel(posX, posY, result[0], 0);
+                        return true;
+                    },
                 );
             }
         }
@@ -960,11 +1284,7 @@ class LibElementsApi /** @implements {LibApi} */ {
             );
         }
         else {
-            ll.AddPatternPatches(
-                {"main": ["pu", "wu"]},
-                (h,d) => `={element:(`,
-                (h,d) => `=globalThis.callPostAssign(s=>{debugger;}).trigger={element:(`
-            );
+            // todo throw warn on game screen if color id overflow is detected
         }
 
         if (AddSaveDataEnhancement)
@@ -983,7 +1303,6 @@ class LibElementsApi /** @implements {LibApi} */ {
                 (cell,store) => `{${cell}=globalThis.hookSaveEnhancementPatchValue(${store},${cell});return Array.isArray(${cell})?{cellType:${cell}[0],hp:${cell}[1]}`,
             );
         }
-
     };
 }
 
@@ -1037,16 +1356,19 @@ globalThis.llElementsPreHook = function () {
         return obj;
     }
 
-    var genericFixRecipe = (recipeType, additionalFixer) => {
+    /** @type {(recipeType: string, additionalFixer?: (obj: RuntimeRecipe)=>void)=>(()=>void)} */
+    globalThis.genericFixRecipe = (recipeType, additionalFixer) => {
         return () => {
             globalThis.llLogVerbose(`ll-elements: Evaluating ${recipeType}Recipes...`);
             var source = globalThis[`${recipeType}RecipesSource`];
             if (!source) throw new Error(`ll-elements: ${recipeType}RecipesSource not found!`);
-            var ids = globalThis.Hook_ElementType;
+            var elmIds = globalThis.Hook_ElementType;
+            var soilIds = globalThis.Hook_CellType;
             var computed = {};
             for (var recipe of source) {
-                var keyId = ids[recipe.key];
-                if (keyId === undefined) throw new Error(`ll-elements: Element type ${recipe.key} not found!`);
+                var keyId = elmIds[recipe.key];
+                keyId = keyId !== undefined ? -keyId : soilIds[recipe.key];
+                if (keyId === undefined) throw new Error(`ll-elements: type ${recipe.key} not found!`);
                 if (computed[keyId]) throw new Error(`ll-elements: Multiple ${recipeType} recipe for ${recipe.key} exists!`);
                 recipe.key = keyId;
                 if (recipe.resultFunc) { // as func in string
@@ -1058,7 +1380,7 @@ globalThis.llElementsPreHook = function () {
                     recipe.result = globalThis.recipeResultResolveToRuntime(recipe.result);
                 }
                 additionalFixer?.(recipe);
-                computed[keyId] = recipe;
+                computed[recipe.key] = recipe;
             }
             globalThis.llLogVerbose(`ll-elements: ${recipeType}Recipes computed:`, computed);
             return computed;
@@ -1070,21 +1392,26 @@ globalThis.llElementsPreHook = function () {
             globalThis.llLogVerbose(`ll-elements: Evaluating ${callbacksType}...`);
             var source = globalThis[`${callbacksType}Source`];
             if (!source) throw new Error(`ll-elements: ${callbacksType}Source not found!`);
-            var ids = globalThis.Hook_ElementType;
+            var elmIds = globalThis.Hook_ElementType;
+            var soilIds = globalThis.Hook_CellType;
             var computed = {};
             for (var callback of source) {
-                var keyId = ids[callback.key];
-                if (keyId === undefined) throw new Error(`ll-elements: Element type ${callback.key} not found!`);
+                var keyId = elmIds[callback.key];
+                keyId = keyId !== undefined ? -keyId : soilIds[callback.key];
+                if (keyId === undefined) throw new Error(`ll-elements: Type ${callback.key} not found!`);
                 if (computed[keyId]) throw new Error(`ll-elements: Multiple ${callbacksType} for ${callback.key} exists!`);
                 callback.key = keyId;
                 callback.func = new Function(callback.func)(); // should return a func 
                 additionalFixer?.(callback);
-                computed[keyId] = callback;
+                computed[callback.keyId] = callback;
             }
             globalThis.llLogVerbose(`ll-elements: ${callbacksType} computed:`, computed);
             return computed;
         }
     }
+
+    globalThis.physicsBindingApi.getCellAtPos = (global, x, y) =>
+        globalThis.physicsBindingApi.getCellAtPosFromStore(global.store, x, y);
 
     /**
      *  @type {(global, posX: number, posY: number, elementsToSpawn: ElementType[],
@@ -1097,11 +1424,63 @@ globalThis.llElementsPreHook = function () {
     *          }) => boolean}
      */
     globalThis.physicsBindingApi.trySpawnElementsAroundPos = (global, posX, posY, elmTypes, area, opts) => {
-        if (elmTypes.length == 0) return true; // nothing to spawn, so return true
         /** @type {PhysicBinding} */
         var bindApi = globalThis.physicsBindingApi;
         var condition = opts?.condition ?? ((x,y) => bindApi.isCellAtPosEmpty(global,x,y));
         var spawner = opts?.spawner ?? ((x,y,eType,_) => bindApi.newElementInstance(eType, x, y));
+        return globalThis.physicsBindingApi.tryAroundPos(posX, posY, elmTypes.length, area,
+            condition, (x,y,idx) => {
+                var elm = spawner(x,y,elmTypes[idx],idx);
+                if (elm) bindApi.setCell(global, x, y, elm);
+            }, {
+                weakBatching: opts?.weakBatching,
+                allowNonTouching: opts?.allowNonTouching,
+            }
+        )
+    };
+
+    
+    /**
+     *  @type {(global, posX: number, posY: number, cellsToSpawn: number[],
+     *          area: [[minX:number, minY:number],[maxX:number, maxY:number]],
+     *          opts?: {
+     *              condition?: (posX: number, posY: number)=>boolean,
+     *              spawner?: (posX: number, posY: number, cellType: number, idx: number)=>Cell,
+     *               weakBatching?: boolean,
+     *              allowNonTouching?: boolean,
+     *          }) => boolean}
+    */
+    globalThis.physicsBindingApi.trySpawnCellsAroundPos = (global, posX, posY, cellTypes, area, opts) => {
+        /** @type {PhysicBinding} */
+        var bindApi = globalThis.physicsBindingApi;
+        var condition = opts?.condition ?? ((x,y) => bindApi.isCellAtPosEmpty(global,x,y));
+        var spawner = opts?.spawner ?? ((x,y,eType,_) => {
+            if (eType >= 0) return eType;
+            else return bindApi.newElementInstance(-eType, x, y);
+        });
+        return globalThis.physicsBindingApi.tryAroundPos(posX, posY, cellTypes.length, area,
+            condition, (x,y,idx) => {
+                var cell = spawner(x,y,cellTypes[idx],idx);
+                if (cell) bindApi.setCell(global, x, y, cell);
+            }, {
+                weakBatching: opts?.weakBatching,
+                allowNonTouching: opts?.allowNonTouching,
+            }
+        )
+    }
+
+    /**
+        *  @type {(posX: number, posY: number, count: number,
+        *          area: [[minX:number, minY:number],[maxX:number, maxY:number]],
+        *          condition: (posX: number, posY: number)=>boolean,
+        *          action: (posX: number, posY: number, idx: number)=>void,
+        *          opts?: {
+        *               weakBatching?: boolean,
+        *              allowNonTouching?: boolean,
+        *          }) => boolean}
+    */
+    globalThis.physicsBindingApi.tryAroundPos = (posX, posY, count, area, condition, action, opts) => {
+        if (count <= 0) return true; // nothing to spawn, so return true
         var weakBatching = opts?.weakBatching ?? false;
         var allowNonTouching = opts?.allowNonTouching ?? false;
         var spaces = [];
@@ -1112,7 +1491,6 @@ globalThis.llElementsPreHook = function () {
         var fronts = [[posX, posY]];
         var done = {};
         var dirs = [[1, 0], [0, 1], [-1, 0], [0, -1]];
-
         // It would be better to use trees for the frontier sorted list, but that brings a whole class,
         // so instead just use sorted array. Js arrays likely get turned into lists so it aren't too slow.
         function dist2(p) { 
@@ -1139,9 +1517,9 @@ globalThis.llElementsPreHook = function () {
         while (fronts.length > 0) {
             var front = fronts.pop();
             var cdPass = condition(front[0], front[1]);
-            if (cdPass) spaces.push(front);
-            if (spaces.length >= elmTypes.length) break;
-            if (!isFirst && !cdPass && !allowNonTouching) continue;
+            if (cdPass === true) spaces.push(front);
+            if (spaces.length >= count) break;
+            if (!isFirst && (cdPass === false) && !allowNonTouching) continue;
             isFirst = false;
             for (var i = 0; i < dirs.length; i++) {
                 var dir = dirs[i];
@@ -1153,42 +1531,43 @@ globalThis.llElementsPreHook = function () {
                 insertSortedDist([newX, newY]);
             }
         }
-        if (spaces.length >= elmTypes.length) {
-            if (spaces.length < elmTypes.length) return false;
-            for (var i = 0; i < elmTypes.length; i++) {
-                var elmType = elmTypes[i];
+        if (spaces.length >= count) {
+            for (var i = 0; i < count; i++) {
                 var pos = spaces[i];
-                bindApi.setCell(global, pos[0], pos[1], spawner(pos[0], pos[1], elmType, i));
+                action(pos[0], pos[1], i);
             }
             return true;
         }
-        if (!weakBatching) return false; // not enough space to spawn stuff
-        var randIds = Array.from(Array(elmTypes.length).keys()).sort(() => Math.random() - 0.5);
+        if (!weakBatching) return false; // not enough space
+        var randIds = Array.from(Array(count).keys()).sort(() => Math.random() - 0.5);
         for (var i = 0; i < spaces.length; i++) {
             var pos = spaces[i];
-            var elmType = elmTypes[randIds[i]];
-            bindApi.setCell(global, pos[0], pos[1], spawner(pos[0], pos[1], elmType, i));
+            var idx = randIds[i];
+            action(pos[0], pos[1], idx);
         }
-        return true; // all elements spawned
+        return true;
     };
 
     /** @type {(RecipeResult: RecipeResult)=>RuntimeRecipeResult} */
     globalThis.recipeResultResolveToRuntime = (RecipeResult) => {
-        var mapping = globalThis.Hook_ElementType;
-        if (!mapping) throw new Error("ll-elements: ElementTypeIds Not Loaded! How!");
+        var elmIds = globalThis.Hook_ElementType;
+        var soilIds = globalThis.Hook_CellType;
+        if (!elmIds || !soilIds) throw new Error("ll-elements: Type Ids Not Loaded! How!");
         var resultEntries = Array.isArray(RecipeResult) ? RecipeResult : [RecipeResult];
         /** @type {RuntimeRecipeResultEntry[]} */
         var runtimeEntries = [];
         for (var i = 0; i < resultEntries.length; i++) {
             var entry = resultEntries[i];
             if (!entry.type) {
-                var id = mapping[entry];
-                if (id === undefined) throw new Error(`ll-elements: Element type ${entry} not found!`);
+                var id = elmIds[entry];
+                id = id !== undefined ? -id : soilIds[entry];
+                if (id === undefined) throw new Error(`ll-elements: type ${entry} not found!`);
                 runtimeEntries.push(id);
                 continue;
             }
-            var id = mapping[entry.type];
-            if (id === undefined) throw new Error(`ll-elements: Element type ${entry.type} not found!`);
+            var id = elmIds[entry.type];
+            id = id !== undefined ? -id : soilIds[entry.type];
+            if (id === undefined) throw new Error(`ll-elements: type ${entry.type} not found!`);
             runtimeEntries.push({type: id, amount: entry.amount});
         }
         return runtimeEntries;
@@ -1216,180 +1595,20 @@ globalThis.llElementsPreHook = function () {
         return list;
     }
 
-
-    globalThis.lazyPropSet(globalThis, "BurnableRecipes",  genericFixRecipe("Burnable"));
-
-    /** @type {(global, flame: Element)=>void} */
-    globalThis.hookOnFlameEndSpawnOutput = (global, flameElm) => {
-        /** @type {PhysicBinding} */
-        var binding = globalThis.physicsBindingApi;
-        /** @type {{elementType: number, chance: number} | number[] | null} */
-        var elmDataOutput = flameElm.data?.output;
-        var x = flameElm.x;
-        var y = flameElm.y;
-        if (elmDataOutput) {
-            var result;
-            if (!Array.isArray(elmDataOutput)) {
-                    result = elmDataOutput.elementType !== false
-                        && Math.random() < (elmDataOutput.chance ?? 1) ? [elmDataOutput.elementType] : [];
-            }
-            else {
-                result = elmDataOutput;
-                globalThis.llLogVerbose("ll-elements: Flame end result:", result);
-            }
-            if (result.length > 1) {
-                var findAllSpot = binding.trySpawnElementsAroundPos(global, x, y,
-                    result.slice(1), [[x-3,y-3],[x+3,y+3]]);
-                if (!findAllSpot) {
-                    // let it live
-                    var newElm = binding.newElementInstance(flameElm.type, x, y);
-                    newElm.data = flameElm.data;
-                    binding.setCell(global, x, y, newElm);
-                    return;
-                }
-                // let the ==1 case deal with spawning the first one
-            }
-            if (result.length == 1) {
-                var newElm = binding.newElementInstance(result[0], x, y);
-                binding.setCell(global, x, y, newElm);
-                return;
-            }
+    /** @template {GameCtx} TCtx @type {(recipeType: string, recipe: RuntimeRecipe<TCtx>, ctx: TCtx)=>(number[]|boolean)} */
+    globalThis.recipeEvalAndProcess = (recipeType, recipe, ctx) => {
+        var result;
+        if (recipe.result instanceof Function) {
+            // if it's a function, call it to get the recipe
+            /** @type {(ctx:TCtx)=>RuntimeRecipeResult} */
+            result = recipe.result(ctx);
         }
-        // otherwise, set it to 'fire'
-        var deadElm = binding.newElementInstance(globalThis.Hook_ElementType.Fire, x, y);
-        binding.setCell(global, x, y, deadElm);
+        else result = recipe.result;
+        result ??= []; // empty array if null
+        globalThis.llLogVerbose(`ll-elements: ${recipeType} recipe result:`, result);
+        if (typeof result === "boolean") return result;
+        return globalThis.runtimeRecipeResultGenerate(result);
     }
-
-    // true to break func, false to continue
-    /** @type {(global, cell: Cell, hotElm: Element)=>boolean} */
-    globalThis.hookOnSparkFlameAtPos = (global, cell, hotElm) => {
-        /** @type {PhysicBinding} */
-        var binding = globalThis.physicsBindingApi;
-        /** @type {{[id:number]:RuntimeRecipe<PhysicCtx>}} */
-        var burnRecipes = globalThis.BurnableRecipes;
-        if (!binding.cellIsElement(cell)) return false; // not a element
-        /** @type {Element} */
-        var elm = cell;
-        var recipe = burnRecipes[elm.type];
-        if (!recipe) return false; // no mapped recipe for this element
-
-        /** @type {RuntimeRecipeResult|boolean|null} */
-        var result;
-        if (recipe.result instanceof Function) {
-            // if it's a function, call it to get the recipe
-            /** @type {(ctx:InteractionCtx)=>RuntimeRecipeResult} */
-            result = recipe.result({api:binding, global:global, cell:elm, otherCell: hotElm});
-        }
-        else result = recipe.result;
-        result ??= []; // empty array if null
-        globalThis.llLogVerbose("ll-elements: Spark flame result:", result);
-        if (typeof result === "boolean") return result; // if returned a bool, don't run normal handling
-        
-        /** @type {number[]} */
-        var genResults = globalThis.runtimeRecipeResultGenerate(result);
-        var newFlame = binding.newElementInstance(globalThis.Hook_ElementType.Flame, cell.x, cell.y);
-        newFlame.data = {output: genResults};
-        binding.setCell(global, cell.x, cell.y, newFlame);
-        return true;
-    }
-
-    globalThis.lazyPropSet(globalThis, "KineticRecipes", genericFixRecipe("Kinetic"));
-
-    /** @type {(global, cell: Element)=>void} */
-    globalThis.hookOnKineticPress = (global, elm) => {
-        if (elm.velocity.y < 200) return false;
-        /** @type {PhysicBinding} */
-        var binding = globalThis.physicsBindingApi;
-        var kineticRecipes = globalThis.KineticRecipes;
-        var recipe = kineticRecipes[elm.type];
-        if (!recipe) return false; // no mapped recipe for this element
-
-        /** @type {RuntimeRecipeResult|boolean|null} */
-        var result;
-        if (recipe.result instanceof Function) {
-            // if it's a function, call it to get the recipe
-            /** @type {(ctx:PhysicCtx)=>RuntimeRecipeResult} */
-            result = recipe.result({api:binding, global:global, cell:elm});
-        }
-        else result = recipe.result;
-        result ??= []; // empty array if null
-        globalThis.llLogVerbose("ll-elements: Kinetic press result:", result);
-        if (typeof result === "boolean") return result; // if returned a bool, don't run normal handling
-        
-        /** @type {number[]} */
-        var genResults = globalThis.runtimeRecipeResultGenerate(result);
-        if (genResults.length == 0) return true; // done
-        var snapGridFloor = v => Math.floor(v / elm.snapGridCellSize) * elm.snapGridCellSize;
-        var snapGridCeil = v => Math.ceil(v / elm.snapGridCellSize) * elm.snapGridCellSize;
-        if (binding.trySpawnElementsAroundPos(global, elm.x, elm.y+2, genResults,
-            [[snapGridFloor(elm.x), elm.y+2], [snapGridCeil(elm.x), elm.y+4]], {allowNonTouching: true})) {
-            binding.clearCell(global, elm);
-            return true;
-        }
-        return false;
-    };
-
-    globalThis.hookInitBasicInteractionRecipes = (table) => {
-        /** @type {{[a: CellTypeIdent]: {[b: CellTypeIdent]: CellTypeIdent}}}*/
-        var newEntries = globalThis.BasicInteractionRecipesSource;
-        if (!newEntries) throw new Error("ll-elements: Basic interaction recipes source not found!");
-        globalThis.llLogVerbose("ll-elements: Basic interaction recipes source:", newEntries);
-        for (var [key, entries] of Object.entries(newEntries)) {
-            var keyId = globalThis.Hook_ElementType[key];
-            if (keyId === undefined) throw new Error(`ll-elements: Element type ${key} not found!`);
-            for (var [from, to] of Object.entries(entries)) {
-                var fromId = globalThis.Hook_ElementType[from];
-                if (fromId === undefined) throw new Error(`ll-elements: Element type ${from} not found!`);
-                var toId = globalThis.Hook_ElementType[to];
-                if (toId === undefined) throw new Error(`ll-elements: Element type ${to} not found!`);
-                var list = table[keyId] ?? (table[keyId] = []);
-                list.push([fromId, toId]);
-            }
-        }
-        globalThis.llLogVerbose("ll-elements: Basic interaction recipes updated:", table);
-    };
-
-    globalThis.lazyPropSet(globalThis, "ComplexInteractionRecipes", genericFixRecipe("ComplexInteraction", (v) => {
-        // also patch the 'constraint' property
-        if (v.constraint) {
-            var id = globalThis.Hook_ElementType[v.constraint];
-            if (id === undefined) throw new Error(`ll-elements: Element type ${v.constraint} not found!`);
-            v.constraint = id;
-        }
-    }));
-
-    /** @type {(global, elmA: Element, elmB: Element)=>void} */
-    globalThis.hookOnComplexInteraction = (global, elm, elmB) => {
-        /** @type {PhysicBinding} */
-        var binding = globalThis.physicsBindingApi;
-        var recipes = globalThis.ComplexInteractionRecipes;
-        var recipe = recipes[elm.type];
-        if (!recipe) return false; // no mapped recipe for this element
-        if (recipe.constraint && recipe.constraint !== elmB.type) return false; // not the right element type
-        
-        /** @type {RuntimeRecipeResult|boolean|null} */
-        var result;
-        if (recipe.result instanceof Function) {
-            // if it's a function, call it to get the recipe
-            /** @type {(ctx:PhysicCtx)=>RuntimeRecipeResult} */
-            result = recipe.result({api:binding, global:global, cell:elm, otherCell: elmB});
-        }
-        else result = recipe.result;
-        result ??= []; // empty array if null
-        globalThis.llLogVerbose("ll-elements: Complex interaction result:", result);
-        if (typeof result === "boolean") return result; // if returned a bool, don't run normal handling
-        
-        /** @type {number[]} */
-        var genResults = globalThis.runtimeRecipeResultGenerate(result);
-        if (genResults.length == 0) return true; // done
-        var x = elm.x;
-        var y = elm.y;
-        if (genResults.length == 1 || binding.trySpawnElementsAroundPos(global, x, y, genResults.slice(1), [[x-3,y-3],[x+3,y+3]])) {
-            binding.setCell(global, x, y, binding.newElementInstance(genResults[0], x, y));
-            return true;
-        }
-        return false;
-    };
 
     globalThis.lazyPropSet(globalThis, "ElementDurationEndCallbacks", genericFixCallbacks("ElementDurationEndCallbacks"));
 
@@ -1499,7 +1718,6 @@ globalThis.llElementsPreHook = function () {
     }
 
     globalThis.patchResolveColorConflicts = (originalColorScheme, hslFunc, soilDarkeningLevels) => {
-
         /**
          * @type {{
          *  element: {[elmId: number]: [Rgba] | [Rgba, Rgba, Rgba, Rgba]},
@@ -2352,6 +2570,40 @@ globalThis.llElementsPreHook = function () {
         };
         store.Mod_SaveDataEnhancement = dataToAdd;
     }
+}
+
+/**
+ *  @template {GameCtx} TCtx
+ * @type {(
+ *      ll: LibAccess, 
+ *      recipeType: string, 
+ *      recipeList: Recipe<TCtx>[], 
+ *      hookFunc: (...any)=>any,
+ *      additionalFixer?: (obj: RuntimeRecipe)=>void
+ *  ) => void}
+ *  */
+function helper_injectRecipes(ll, recipeType, recipeList, hookFunc, additionalFixer) {
+    var recipesFormatted = [];
+    for (var i = 0; i < recipeList.length; i++) {
+        var recipe = recipeList[i];
+        if (!recipe.key) throw new Error(`ll-elements: ${recipeType} recipe ${recipe} doesn't have a key!`);
+        if (recipe.result instanceof Function) {
+            // serialize func
+            recipe.resultFunc = `return ${recipe.result.toString()}`;
+            delete recipe.result;
+        }
+        recipesFormatted.push(recipe);
+    }
+    var json = JSON.stringify(recipesFormatted);
+    //console.log(`${recipeType} Recipes:`, recipesFormatted);
+    var recipeTypeWrapped = JSON.stringify(recipeType).slice(1, -1);
+    var fixerStr = additionalFixer !== undefined ? ','+additionalFixer.toString() : "";
+    var hookFuncStr = `${hookFunc.toString()}`;
+    ll.AddInjectionToScriptHeading(`
+        globalThis.${recipeType}RecipesSource = ${json};
+        globalThis.lazyPropSet(globalThis, "${recipeTypeWrapped}Recipes", globalThis.genericFixRecipe("${recipeTypeWrapped}"${fixerStr}));
+        globalThis.hookOn${recipeType}Recipe = ${hookFuncStr};
+    `);
 }
 
 function rgb2hue(color) {
