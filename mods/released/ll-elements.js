@@ -1,7 +1,7 @@
 
 exports.modinfo = {
     name: "ll-elements",
-    version: "0.3.0",
+    version: "0.3.1",
     dependencies: [],
     modauthor: "TomTheFurry",
 };
@@ -40,6 +40,9 @@ exports.modinfo = {
 // - added binding `trySpawnCellsAroundPos` that supports both soils and elements
 // - added binding `tryAroundPos` for your custom logic for scnaning around a position
 // - impl refactor, to make callbacks handling more uniform
+// v.3.1 Bugfix:
+// - Fixed incorrect vanilla burn result spawning soils instead of elements
+// - Fixed save id remapping to handle damaged soils correctly
 
 // ==== Headers / Class Defs ====
 // #region Headers / Class Defs
@@ -849,7 +852,7 @@ class LibElementsApi /** @implements {LibApi} */ {
                         var result;
                         if (!Array.isArray(elmDataOutput)) {
                                 result = elmDataOutput.elementType !== false
-                                    && Math.random() < (elmDataOutput.chance ?? 1) ? [elmDataOutput.elementType] : [];
+                                    && Math.random() < (elmDataOutput.chance ?? 1) ? [-elmDataOutput.elementType] : [];
                         }
                         else {
                             result = elmDataOutput;
@@ -2151,7 +2154,7 @@ globalThis.llElementsPreHook = function () {
                         var newId = globalThis.Hook_CellType[ident];
                         cellAllMatch = cellAllMatch && (newId === id);
                         if (newId === undefined) {
-                            console.warn(`ll-elements: Previously existed CellType ${ident} not found.`);
+                            //console.error(`ll-elements: Previously existed CellType ${ident} (#${id}) not found.`);
                             cellHasMissingId = true;
                         }
                         cellRemappingTable[id] = {newId: newId, ident: ident};
@@ -2160,7 +2163,7 @@ globalThis.llElementsPreHook = function () {
                         var newId = globalThis.Hook_ElementType[ident];
                         elementAllMatch = elementAllMatch && (newId === id);
                         if (newId === undefined) {
-                            console.warn(`ll-elements: Previously existed ElementType ${ident} not found.`);
+                            //console.error(`ll-elements: Previously existed ElementType ${ident} (#${id}) not found.`);
                             elementHasMissingId = true;
                         }
                         elementRemappingTable[id] = {newId: newId, ident: ident};
@@ -2170,29 +2173,41 @@ globalThis.llElementsPreHook = function () {
                     console.info("ll-elements: All cell and element types match the remapping table. No save-data-id-patching needed.");
                     return cell;
                 }
-                if (cellHasMissingId) {
-                    console.warn("ll-elements: Some cell types are missing. Will attempt to replace them with 'Empty'.");
-                }
-                if (elementHasMissingId) {
-                    console.warn("ll-elements: Some element types are missing. Will attempt to replace them with 'Fire'.");
-                }
-                console.info("ll-elements: Running save-data-id-patching...");
                 var backupCellType = globalThis.Hook_CellType["Empty"];
                 var backupElementType = globalThis.Hook_ElementType["Fire"]; // should go 'poof' and disappear
-                
+                Object.entries(cellRemappingTable).forEach(([id, e]) => {if (e.newId === +id) delete cellRemappingTable[+id]});
+                Object.entries(elementRemappingTable).forEach(([id, e]) => {if (e.newId === +id) delete elementRemappingTable[+id]});
+                console.warn("ll-elements: Detected some mismatches in id mapping. Running patching with following remapping:");
+                for (var [id, e] of Object.entries(cellRemappingTable)) {
+                    if (e.newId != null) {
+                        console.warn(`ll-elements: CellType ${e.ident}: #${id} -> #${e.newId}`);
+                    } else {
+                        console.error(`ll-elements: CellType ${e.ident}: #${id} -> <MISSING>`);
+                    }
+                }
+                for (var [id, e] of Object.entries(elementRemappingTable)) {
+                    if (e.newId != null) {
+                        console.warn(`ll-elements: ElementType ${e.ident}: #${id} -> #${e.newId}`);
+                    } else {
+                        console.error(`ll-elements: ElementType ${e.ident}: #${id} -> <MISSING>`);
+                    }
+                }
+                if (cellHasMissingId) {
+                    console.error("ll-elements: Some cell types are missing. Will attempt to replace them with 'Empty'.");
+                }
+                if (elementHasMissingId) {
+                    console.error("ll-elements: Some element types are missing. Will attempt to replace them with 'Fire'.");
+                }
                 var remappingPaths = dataToAdd.indexRemappingPaths;
                 if (!remappingPaths) {
                     console.error("ll-elements: Save file's enhancement data does not contain indexRemappingPaths. Unable to run save-data-id-patching.");
                     return cell;
                 }
-                Object.entries(cellRemappingTable).forEach(([id, e]) => {if (e.newId === +id) delete cellRemappingTable[+id]});
-                Object.entries(elementRemappingTable).forEach(([id, e]) => {if (e.newId === +id) delete elementRemappingTable[+id]});
     
                 var elmRemappingPaths = remappingPaths["element"] ?? [];
     
                 cache.fixedElmConut = 0;
                 cache.fixedCellCount = 0;
-    
                 /** @type {(obj: object, prop: string) => void} */
                 const fixElmIdx = (obj, prop) =>{
                     var val = obj[prop];
@@ -2273,24 +2288,13 @@ globalThis.llElementsPreHook = function () {
                         fixByMetaType(targetObj, lastPath, metaType);
                     }
                 }
-    
-                const remapCell = (obj, prop) => {
-                    var val = obj[prop];
-                    if (val === undefined) return;
-                    if (Number.isInteger(val)) {
-                        fixCellIdx(obj, prop);
-                    }
-                    else {
-                        fixCellIdx(val, "cellType"); // used when cell have hp
-                    }
-                }
 
                 cache.fixer = function (cell) {
                     var container = [cell];
                     if (Array.isArray(cell) && cell.length == 2) {
                         // this is a cell with hp
-                        fixCellIdx(container, 0);
-                        return container[0];
+                        fixCellIdx(cell, 0);
+                        return cell;
                     }
                     if (typeof cell == "object") {
                         // a full element object. At the moment of writing, only particle elements are under this
@@ -2324,203 +2328,6 @@ globalThis.llElementsPreHook = function () {
         }
         if (!cache.enabled) return cell;
         return cache.fixer(cell);
-    }
-
-    globalThis.hookOnLoadSaveStartApplyEnhancement = (glb) => {
-        var store = glb.store;
-        debugger;
-        if (!store.Mod_SaveDataEnhancement) {
-            console.info("ll-elements: Save file's enhancement data does not exist. Skipping save-data-id-patching.");
-            return;
-        }
-        var dataToAdd = store.Mod_SaveDataEnhancement;
-        if (dataToAdd.enhancementVersion > 0) {
-            console.warn("ll-elements: Save file's enhancement data version is higher than this mod's supported version! Loading this save may cause issues!");
-        }
-        try {
-            /** @type {{[ident: string]: number}} */
-            var oldCellTypes = dataToAdd.cellTypes;
-            /** @type {{[ident: string]: number}} */
-            var oldElmTypes = dataToAdd.elementTypes;
-            /** @type {{[ident: string]: number}} */
-
-
-            if (!oldCellTypes || !oldElmTypes) {
-                console.error("ll-elements: Save file's enhancement data does not contain cellTypes or elementTypes. Skipping save-data-id-patching.");
-                return;
-            }
-            /** @type {{newId?: number, ident: string}[]} */
-            var cellRemappingTable = []; // old to new
-            /** @type {{newId?: number, ident: string}[]} */
-            var elementRemappingTable = []; // old to new
-            var cellHasMissingId = false;
-            var elementHasMissingId = false;
-            var cellAllMatch = true;
-            var elementAllMatch = true;
-            {
-                for (var [ident, id] of Object.entries(oldCellTypes)) {
-                    var newId = globalThis.Hook_CellType[ident];
-                    cellAllMatch = cellAllMatch && (newId === id);
-                    if (newId === undefined) {
-                        console.warn(`ll-elements: Previously existed CellType ${ident} not found.`);
-                        cellHasMissingId = true;
-                    }
-                    cellRemappingTable[id] = {newId: newId, ident: ident};
-                }
-                for (var [ident, id] of Object.entries(oldElmTypes)) {
-                    var newId = globalThis.Hook_ElementType[ident];
-                    elementAllMatch = elementAllMatch && (newId === id);
-                    if (newId === undefined) {
-                        console.warn(`ll-elements: Previously existed ElementType ${ident} not found.`);
-                        elementHasMissingId = true;
-                    }
-                    elementRemappingTable[id] = {newId: newId, ident: ident};
-                }
-            }
-            debugger;
-            if (cellAllMatch && elementAllMatch) {
-                console.info("ll-elements: All cell and element types match the remapping table. No save-data-id-patching needed.");
-                return;
-            }
-            if (cellHasMissingId) {
-                console.warn("ll-elements: Some cell types are missing. Will attempt to replace them with 'Empty'.");
-            }
-            if (elementHasMissingId) {
-                console.warn("ll-elements: Some element types are missing. Will attempt to replace them with 'Fire'.");
-            }
-            console.info("ll-elements: Running save-data-id-patching...");
-            var backupCellType = globalThis.Hook_CellType["Empty"];
-            var backupElementType = globalThis.Hook_ElementType["Fire"]; // should go 'poof' and disappear
-            
-            var remappingPaths = dataToAdd.indexRemappingPaths;
-            if (!remappingPaths) {
-                console.error("ll-elements: Save file's enhancement data does not contain indexRemappingPaths. Unable to run save-data-id-patching.");
-                return;
-            }
-            Object.entries(cellRemappingTable).forEach(([id, e]) => {if (e.newId === +id) delete cellRemappingTable[+id]});
-            Object.entries(elementRemappingTable).forEach(([id, e]) => {if (e.newId === +id) delete elementRemappingTable[+id]});
-
-            var elmRemappingPaths = remappingPaths["element"] ?? [];
-
-            var fixedElmConut = 0;
-            var fixedCellCount = 0;
-
-            /** @type {(obj: object, prop: string) => void} */
-            const fixElmIdx = (obj, prop) =>{
-                var val = obj[prop];
-                if (isNaN(val)) return;
-                var remap = elementRemappingTable[val];
-                if (!remap) return;
-                val = remap.newId ?? backupElementType;
-                obj[prop] = val;
-                fixedElmConut++;
-            }
-
-            /** @type {(obj: object, prop: string) => void} */
-            const fixCellIdx = (obj, prop) => {
-                var val = obj[prop];
-                if (isNaN(val)) return;
-                var remap = cellRemappingTable[val];
-                if (!remap) return;
-                val = remap.newId ?? backupCellType;
-                obj[prop] = val;
-                fixedCellCount++;
-            }
-
-            /** @type {(obj: object, prop: string, metaType: string[]) => void} */
-            const fixByMetaType = (obj, prop, metaType) => {
-                if (obj[prop] === undefined) return;
-                switch (metaType[0]) {
-                    case "elementIndex":
-                        fixElmIdx(obj, prop);
-                        break;
-                    case "element":
-                        if (typeof obj[prop] == "object") remapElm(obj[prop]);
-                        break
-                    case "cellIndex":
-                        fixCellIdx(obj, prop);
-                        break;
-                    case "cell":
-                        remapCell(obj, prop);
-                    case "array":
-                        if (Array.isArray(obj[prop])) {
-                            var nextMetaType = metaType.slice(1);
-                            if (nextMetaType[0] === undefined) {
-                                console.warn("ll-elements: Invalid metaType:", metaType);
-                                return;
-                            }
-                            for (var i = 0; i < obj[prop].length; i++) {
-                                fixByMetaType(obj[prop], i, nextMetaType);
-                            }
-                        }
-                        break;
-                    default:
-                        console.warn("ll-elements: Unknown metaType:", metaType[0]);
-                        break;
-                }
-            }
-
-            /** @type {(elm: Element) => void} */
-            const remapElm = (elm) => {
-                fixElmIdx(elm, "type");
-                for (var remapInfo of elmRemappingPaths) {
-                    /** @type {string} */
-                    var type = remapInfo.type;
-                    if (!type) continue;
-                    var typeIdent = globalThis.Hook_ElementType[type];
-                    if (typeIdent !== elm.type) continue;
-                    /** @type {string[]} */
-                    var paths = remapInfo.paths;
-                    if (!paths || !paths.length || paths.length < 1) continue;
-                    var metaType = remapInfo.metaType;
-                    if (!metaType || !metaType.length || metaType.length < 1) continue;
-                    var pathsBeforeLast = paths.slice(0, -1);
-                    var lastPath = paths[paths.length - 1];
-                    var targetObj = elm;
-                    for (var path of pathsBeforeLast) {
-                        targetObj = targetObj[path];
-                        if (!targetObj) break;
-                    }
-                    if (!targetObj) continue;
-                    fixByMetaType(targetObj, lastPath, metaType);
-                }
-            }
-
-            const remapCell = (obj, prop) => {
-                var val = obj[prop];
-                if (val === undefined) return;
-                if (Number.isInteger(val)) {
-                    fixCellIdx(obj, prop);
-                }
-                else {
-                    fixCellIdx(val, "cellType"); // used when cell have hp
-                }
-            }
-
-
-            var matrix = store.world.matrix;
-            for (var py=0; py<matrix.length; py++) {
-                for (var px=0; px<matrix[py].length; px++) {
-                    var baseObj = matrix[py];
-                    var cell = baseObj[px];
-                    if (!!(cell?.type)) {
-                        remapElm(cell);
-                    }
-                    else {
-                        remapCell(baseObj, px);
-                    }
-                }
-            }
-
-            console.info("ll-elements: Finished save-data-id-patching.");
-            console.info("ll-elements: Remapped element id count:", fixedElmConut);
-            console.info("ll-elements: Remapped cell id count:", fixedCellCount);
-            debugger;
-        }
-        catch (e) {
-            console.error("ll-elements: Failed to apply id patching!", e);
-            return;
-        }
     }
 
     globalThis.hookOnLoadSaveEndInjectEnhancement = (glb) => {
