@@ -1,11 +1,12 @@
 
 /// BELOW IS COPY-PASTABLE INCLUDES FOR LIBLOADER
 
-// v.3 change: Added intercepts for 515 with fixes and improvements to how nested patching works
+// v.0.3 change: Added intercepts for 515 with fixes and improvements to how nested patching works
 // Also added proper libloader versioning & self-overriding
-// v.4 change: Added helper stuff + fix a bug with version overriding
-// v1.0 change: First Release along with elements api
-// v1.1 change: Added globalThis.llLogVerbose(...) which makes logging messages be in debug when logged from workers thread (reduce spams)
+// v.0.4 change: Added helper stuff + fix a bug with version overriding
+// v.1.0 change: First Release along with elements api
+// v.1.1 change: Added globalThis.llLogVerbose(...) which makes logging messages be in debug when logged from workers thread (reduce spams)
+// v.1.2 change: Fix llLogVerbose undefined
 
 /**
  *  @typedef {{
@@ -215,6 +216,18 @@ function libLoaderInit() {
                 globalThis.logBase = globalThis.LibLoader_TrueLogBase;
                 // setup libloader stuff
                 var ll = globalThis.LibLoader = new LibAccess(globalThis.loadedMods) // todo put api here
+                ll.AddInjectionToScriptHeading(() => {
+                    globalThis.llLogVerbose = (...args) => {
+                        var inWorker = !!(globalThis.scriptId);
+                        if (inWorker) {
+                            console.debug(...args);
+                        }
+                        else {
+                            console.log(...args);
+                        }
+                    }
+                });
+
                 // invoke loading events
                 // event: apiInit
                 ll.InvokeEvent("apiInit", (e,c) => {
@@ -383,16 +396,6 @@ function libLoaderInit() {
 
         globalThis.PrefetchInject = null;
         
-        globalThis.llLogVerbose = (...args) => {
-            var inWorker = !!(globalThis.scriptId);
-            if (inWorker) {
-                console.debug(...args);
-            }
-            else {
-                console.log(...args);
-            }
-        }
-
         globalThis.redirectedWorkerNew = function (url) {
             if (!globalThis.PrefetchInject) {
                 var fetchablesKeys = [["modloader-api/active-mod-paths", "application/json"], ["js/515.bundle.js", "text/javascript"]];

@@ -1,7 +1,7 @@
 
 exports.modinfo = {
     name: "ll-elements",
-    version: "0.3.1",
+    version: "0.3.2",
     dependencies: [],
     modauthor: "TomTheFurry",
 };
@@ -43,6 +43,9 @@ exports.modinfo = {
 // v.3.1 Bugfix:
 // - Fixed incorrect vanilla burn result spawning soils instead of elements
 // - Fixed save id remapping to handle damaged soils correctly
+// v.3.2 Bugfix:
+// - Fixed incorrect handling of recipes that has no outputs
+// - Fix Q-Entangled particles spawned in basic interaction recipes due to wrong values
 
 // ==== Headers / Class Defs ====
 // #region Headers / Class Defs
@@ -231,7 +234,7 @@ class CellTypeDefinition {
     /** @type {(cell: Element, elmColorMap: {[ElmId: number]: ([Rgba] | [Rgba, Rgba, Rgba, Rgba])})=>Rgba} */
     elementColorVarientSelectionFunction = undefined;
 
-    /** @type {Hsl | [Hsl, Hsl, Hsl, Hsl] | Rgba | [Rgba, Rgba, Rgba, Rgba] | null} */
+    /** @type {[Hsl] | [Hsl, Hsl, Hsl, Hsl] | [Rgba] | [Rgba, Rgba, Rgba, Rgba] | null} */
     // the color(s) of the element, optionally with up to 4 varients
     // Note: Hsl is [H, S, L] where H is 0-360, S is 0-100, L is 0-100
     elementColor = undefined;
@@ -856,7 +859,7 @@ class LibElementsApi /** @implements {LibApi} */ {
                         }
                         else {
                             result = elmDataOutput;
-                            globalThis.llLogVerbose("ll-elements: Flame end result:", result);
+                            //globalThis.llLogVerbose("ll-elements: Flame end result:", result);
                         }
                         if (result.length > 1) {
                             var findAllSpot = binding.trySpawnCellsAroundPos(global, x, y,
@@ -902,7 +905,10 @@ class LibElementsApi /** @implements {LibApi} */ {
                         if (!recipe) return false; // no mapped recipe for this element
                         var result = globalThis.recipeEvalAndProcess("KineticPress", recipe, {api:binding, global:global, cell:elm});
                         if (typeof result === "boolean") return result;
-                        if (result.length == 0) return true;
+                        if (result.length == 0) {
+                            binding.clearCell(global, elm);
+                            return true;
+                        }
                         var snapGridFloor = v => Math.floor(v / 4) * 4;
                         var snapGridCeil = v => Math.ceil(v / 4) * 4;
                         if (binding.trySpawnCellsAroundPos(global, elm.x, elm.y+2, result,
@@ -953,7 +959,10 @@ class LibElementsApi /** @implements {LibApi} */ {
                         if (!recipe) return false; // no mapped recipe for this element
                         var result = globalThis.recipeEvalAndProcess("Shaker", recipe, {api:binding, global:global, cell:elm});
                         if (typeof result === "boolean") return result;
-                        if (result.length == 0) return true;
+                        if (result.length == 0) {
+                            binding.clearCell(global, elm);
+                            return true;
+                        }
                         var snapGridFloor = v => Math.floor(v / 4) * 4;
                         var snapGridCeil = v => Math.ceil(v / 4) * 4;
                         if (binding.trySpawnCellsAroundPos(global, elm.x, elm.y, result.slice(1),
@@ -1001,6 +1010,13 @@ class LibElementsApi /** @implements {LibApi} */ {
                         lookup[-keyId] = newDict;
                     }
                     globalThis.llLogVerbose(`ll-elements: BasicInteractionRecipes evaluated:`, lookup);
+                    globalThis.BasicInteractionRecipesInverse = [];
+                    for (var [key, dict] of Object.entries(lookup)) {
+                        for (var [bottomKey, to] of Object.entries(dict)) {
+                            var dict = (globalThis.BasicInteractionRecipesInverse[bottomKey] ??= []);
+                            dict[key] = to;
+                        }
+                    }
                     return lookup;
                 };
                 ll.AddInjectionToScriptHeading(`
@@ -1013,14 +1029,16 @@ class LibElementsApi /** @implements {LibApi} */ {
                     if (!result) return false; // no mapped recipe for this element
                     /** @type {PhysicBinding} */
                     var api = globalThis.physicsBindingApi;
-                    var topCell = result[0] === undefined ? undefined : result[0] >= 0 ? result[0]
-                        : api.newElementInstance(-result[0], elmA.x, elmA.y);
-                    var bottomCell = result[1] === undefined ? undefined : result[1] >= 0 ? result[1]
-                        : api.newElementInstance(-result[1], elmA.x, elmA.y);
-                    topCell === undefined ? api.clearCell(global, elmA)
-                        : api.setCell(global, elmA.x, elmA.y, topCell);
-                    bottomCell === undefined ? api.clearCell(global, elmB)
-                        : api.setCell(global, elmB.x, elmB.y, bottomCell);
+                    {
+                        var topCell = result[0] === undefined ? undefined : result[0] >= 0 ? result[0]
+                            : api.newElementInstance(-result[0], elmA.x, elmA.y);
+                        var bottomCell = result[1] === undefined ? undefined : result[1] >= 0 ? result[1]
+                            : api.newElementInstance(-result[1], elmB.x, elmB.y);
+                        topCell === undefined ? api.clearCell(global, elmA)
+                            : api.setCell(global, elmA.x, elmA.y, topCell);
+                        bottomCell === undefined ? api.clearCell(global, elmB)
+                            : api.setCell(global, elmB.x, elmB.y, bottomCell);
+                    }
                     return true;
                 };
                 ll.AddInjectionToScriptHeading(`globalThis.hookOnBasicInteractionRecipe = ${hookOnBasicInteractionRecipe.toString()};`);
@@ -1045,6 +1063,10 @@ class LibElementsApi /** @implements {LibApi} */ {
                         if (typeof result === "boolean") return result;
                         var x = elm.x;
                         var y = elm.y;
+                        if (result.length == 0) {
+                            binding.clearCell(global, elm);
+                            return true;
+                        }
                         if (result.length == 1 || binding.trySpawnCellsAroundPos(global, x, y, result.slice(1), [[x-3,y-3],[x+3,y+3]])) {
                             binding.setCell(global, x, y, result[0] >= 0 ? result[0] : binding.newElementInstance(-result[0], x, y));
                             return true;
@@ -1118,7 +1140,10 @@ class LibElementsApi /** @implements {LibApi} */ {
                         if (!recipe) return false; // no mapped recipe for this element
                         var result = globalThis.recipeEvalAndProcess("SoilDug", recipe, {api:binding, global:global, cell:cellType, x:posX, y:posY, velocity: vel});
                         if (typeof result === "boolean") return result;
-                        if (result.length == 0) return true;
+                        if (result.length == 0) {
+                            binding.clearCell(global, posX, posY);
+                            return true;
+                        }
                         var spawnerWithVel = (x,y,t,_) => {
                             if (t >= 0) return t;
                             var elmType = -t;
@@ -1608,7 +1633,7 @@ globalThis.llElementsPreHook = function () {
         }
         else result = recipe.result;
         result ??= []; // empty array if null
-        globalThis.llLogVerbose(`ll-elements: ${recipeType} recipe result:`, result);
+        //globalThis.llLogVerbose(`ll-elements: ${recipeType} recipe result:`, result);
         if (typeof result === "boolean") return result;
         return globalThis.runtimeRecipeResultGenerate(result);
     }
